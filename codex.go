@@ -27,6 +27,7 @@ type CodexBackend struct {
 	WorkDir   string
 	ExtraArgs []string
 	Home      string // isolated CODEX_HOME; empty to use the user's own
+	WebSearch bool   // let an isolated codex search the web
 
 	mu       sync.Mutex
 	features []string // enabled features of the installed codex
@@ -36,10 +37,21 @@ type CodexBackend struct {
 // other feature the installed codex reports as enabled is turned off, so
 // that a feature added by a later version starts disabled here.
 //
-// code_mode_host carries the web search tool. With it codex also sees
-// apply_patch, which the read-only sandbox refuses.
-func codexKeep(feature string, p Prompt) bool {
-	return feature == "code_mode_host" && p.WebSearch
+// code_mode_host carries the web search tool, and with it apply_patch,
+// which the read-only sandbox refuses. It is a host for tools, more than
+// web search alone: whether to keep it is the operator's choice (WebSearch),
+// never the client's. CheckPrompt refuses the requests that would need it
+// otherwise.
+func (c *CodexBackend) keep(feature string, p Prompt) bool {
+	return feature == "code_mode_host" && c.WebSearch && p.WebSearch
+}
+
+// CheckPrompt refuses what this backend is not set up to do.
+func (c *CodexBackend) CheckPrompt(p Prompt) error {
+	if p.WebSearch && c.Home != "" && !c.WebSearch {
+		return errors.New("web search is not enabled for codex on this server (codex_web_search)")
+	}
+	return nil
 }
 
 // enabledFeatures asks the installed codex which features are on, in the
@@ -182,7 +194,7 @@ func (c *CodexBackend) Run(ctx context.Context, model string, p Prompt) <-chan E
 				return
 			}
 			for _, f := range features {
-				if !codexKeep(f, p) {
+				if !c.keep(f, p) {
 					args = append(args, "--disable", f)
 				}
 			}

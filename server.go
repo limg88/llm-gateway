@@ -67,7 +67,7 @@ func NewServer(cfg Config) *Server {
 				return float64(idle)
 			})
 		case "codex":
-			c := &CodexBackend{Bin: cfg.CodexBin, WorkDir: cfg.WorkDir, ExtraArgs: cfg.CodexExtraArgs}
+			c := &CodexBackend{Bin: cfg.CodexBin, WorkDir: cfg.WorkDir, ExtraArgs: cfg.CodexExtraArgs, WebSearch: cfg.CodexWebSearch}
 			if cfg.CodexIsolate == nil || *cfg.CodexIsolate {
 				home, err := newCodexHome()
 				if err != nil {
@@ -394,6 +394,9 @@ func (s *Server) prepare(endpoint string, req ChatCompletionRequest, key *apiKey
 		emulated, err := applyTools(&p, req, t.backend.NativeFunctions())
 		if err == nil {
 			err = t.backend.CheckImages(p.Images)
+		}
+		if checker, ok := t.backend.(interface{ CheckPrompt(Prompt) error }); ok && err == nil {
+			err = checker.CheckPrompt(p)
 		}
 		if err == nil && !emulated && req.ResponseFormat != nil {
 			err = applyFormat(&p, req.ResponseFormat)

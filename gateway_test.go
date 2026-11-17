@@ -636,10 +636,19 @@ func TestCodexIsolation(t *testing.T) {
 	if strings.Contains(got, "--disable quiet_feature") {
 		t.Errorf("a feature that is off was disabled: %s", got)
 	}
-	// Web search needs the code-mode host, and nothing else.
-	status, body := post(t, ts, "/v1/chat/completions", "", obj{"model": "codex", "messages": user("ECHO"), "web_search_options": obj{}})
+	// A client cannot bring the tool host back by asking for web search.
+	search := obj{"model": "codex", "messages": user("ECHO"), "web_search_options": obj{}}
+	if status, body := post(t, ts, "/v1/chat/completions", "", search); status != 400 || !strings.Contains(string(body), "codex_web_search") {
+		t.Errorf("web search without the operator's consent: %d %s", status, body)
+	}
+	// The operator can: then web search keeps that host, and nothing else.
+	_, searching := newTestServer(t, func(c *Config) { c.CodexWebSearch = true })
+	status, body := post(t, searching, "/v1/chat/completions", "", search)
 	if got := string(body); status != 200 || strings.Contains(got, "--disable code_mode_host") || !strings.Contains(got, "--disable shell_tool") {
 		t.Errorf("web search: %d %s", status, got)
+	}
+	if got := ask(searching); !strings.Contains(got, "--disable code_mode_host") {
+		t.Errorf("the tool host stayed on without web search: %s", got)
 	}
 	entries, _ := os.ReadDir(home)
 	for _, e := range entries {

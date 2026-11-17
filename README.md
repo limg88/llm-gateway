@@ -82,7 +82,7 @@ Every `/v1` endpoint is also served without the prefix.
 | Streaming | text deltas | whole messages | text deltas |
 | Function calling | native, over MCP | emulated with a JSON schema | passed through |
 | Images | data URLs and http(s) URLs | data URLs | passed through |
-| Web search | yes, with citations | yes, with citations | no |
+| Web search | yes, with citations | with `codex_web_search` | no |
 | Structured output (`json_schema`) | yes | yes | passed through |
 | Reasoning effort | yes | yes | passed through |
 | Warm processes | yes | no | n/a |
@@ -122,7 +122,8 @@ prompt comes from the client: what they may do is cut down to answering.
   or instructions), and every feature the installed codex reports as
   enabled is turned off: shell, file and image tools, plugins, browser and
   computer use, sub-agents, and whatever a later version adds. Web search
-  keeps the one feature it needs. If the features cannot be listed the
+  needs codex's tool host back on, so it is refused unless the operator
+  sets `codex_web_search`. If the features cannot be listed the
   request fails rather than run unprotected, and `codex_extra_args` that
   would widen the sandbox are refused (`codex_isolate`).
 
@@ -174,6 +175,7 @@ File-only settings (see [`config.example.json`](config.example.json)):
 | `upstreams` | OpenAI-compatible APIs: `name`, `base_url`, `api_key_env`, `models` |
 | `claude_isolate` | ignore the user's claude settings, default `true` |
 | `claude_web_fetch` | with web search, also let claude fetch URLs from this machine, default `false` |
+| `codex_web_search` | let an isolated codex search the web, which keeps its tool host on, default `false` |
 | `codex_isolate` | run codex with an empty home and every enabled feature turned off, default `true` |
 | `claude_extra_args`, `codex_extra_args` | arguments added to every command line |
 | `response_ttl`, `response_max` | how long and how many conversations are kept for `previous_response_id` |
@@ -186,8 +188,9 @@ The default address is the loopback interface. To serve other machines set
 the server uses your CLI accounts. Keys are accepted as
 `Authorization: Bearer <key>` or `x-api-key: <key>`.
 
-Turning `codex_isolate` off, or `claude_web_fetch` on, gives every client
-with a key a way to the machine's files or to its network: see *Isolation*.
+Turning `codex_isolate` off, or `claude_web_fetch` or `codex_web_search` on,
+widens what every client with a key can reach. The first two give
+a way to the machine's files or to its network: see *Isolation*.
 
 `/health`, `/metrics` and `/mcp/{id}` take no key. The MCP paths carry an
 unguessable id and only describe the functions of a request in progress.

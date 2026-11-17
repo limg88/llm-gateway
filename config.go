@@ -49,6 +49,7 @@ type Config struct {
 	ClaudeIsolate   *bool               `json:"claude_isolate"`
 	ClaudeWebFetch  bool                `json:"claude_web_fetch"` // with web search, let claude fetch URLs from this machine
 	CodexIsolate    *bool               `json:"codex_isolate"`
+	CodexWebSearch  bool                `json:"codex_web_search"` // let an isolated codex keep the tool host web search needs
 	ClaudeExtraArgs []string            `json:"claude_extra_args"`
 	CodexExtraArgs  []string            `json:"codex_extra_args"`
 	ResponseTTL     int                 `json:"response_ttl"` // seconds a response can be continued
