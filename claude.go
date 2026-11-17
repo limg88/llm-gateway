@@ -7,11 +7,11 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
-	"errors"
-	"fmt"
 	"io"
 	"log/slog"
+	"os"
 	"os/exec"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -28,6 +28,13 @@ const (
 // The CLI runs with no built-in tools, in an empty directory, and talks
 // stream-json on both sides, so that a process can be started before the
 // request it will serve arrives.
+//
+// The CLI takes an output budget from its environment
+// (CLAUDE_CODE_MAX_OUTPUT_TOKENS) and passes it to the provider, which cuts
+// every generation at that many tokens, thinking included. Left alone, the
+// CLI then asks the model to resume from the cut, a few times over. That is
+// not one answer: the gateway stops the CLI at the first cut and returns
+// what was written, marked as cut short.
 type ClaudeBackend struct {
 	Bin       string
 	WorkDir   string
@@ -125,10 +132,11 @@ func (c *ClaudeBackend) args(model string, p Prompt, functionsURL string) []stri
 	return append(args, c.ExtraArgs...)
 }
 
-// poolKey identifies everything that goes on the command line: two prompts
-// with the same key can use the same waiting process.
+// poolKey identifies everything that goes on the command line or in the
+// environment: two prompts with the same key can use the same waiting
+// process.
 func poolKey(model string, p Prompt) string {
-	b, _ := json.Marshal([]any{model, p.System, p.Schema, p.WebSearch, p.Functions, p.Effort})
+	b, _ := json.Marshal([]any{model, p.System, p.Schema, p.WebSearch, p.Functions, p.Effort, p.MaxTokens})
 	sum := sha256.Sum256(b)
 	return hex.EncodeToString(sum[:])
 }
@@ -152,12 +160,15 @@ func (c *ClaudeBackend) start(model string, p Prompt) (*claudeProc, error) {
 	url, unpublish := "", func() {}
 	if len(p.Functions) > 0 {
 		if c.Publish == nil {
-			return nil, errors.New("claude: functions are not available")
+			return nil, newBackendError("claude", failGeneric, "functions are not available")
 		}
 		url, unpublish = c.Publish(p.Functions)
 	}
 	cmd := exec.Command(c.Bin, c.args(model, p, url)...)
 	cmd.Dir = c.WorkDir
+	if p.MaxTokens > 0 {
+		cmd.Env = append(os.Environ(), "CLAUDE_CODE_MAX_OUTPUT_TOKENS="+strconv.Itoa(p.MaxTokens))
+	}
 	proc := &claudeProc{cmd: cmd, lines: make(chan []byte, 64), done: make(chan struct{}), cleanup: unpublish}
 	cmd.Stderr = &limitedWriter{w: &proc.stderr, n: maxStderr}
 	stdin, err := cmd.StdinPipe()
@@ -172,7 +183,7 @@ func (c *ClaudeBackend) start(model string, p Prompt) (*claudeProc, error) {
 		}
 	}
 	unpublish()
-	return nil, fmt.Errorf("starting %s: %w", c.Bin, err)
+	return nil, newBackendError("claude", failGeneric, "starting the CLI: "+err.Error())
 }
 
 func (p *claudeProc) read(stdout io.Reader) {
@@ -228,7 +239,7 @@ func (p *claudeProc) exitErr() error {
 	p.killMu.Lock()
 	defer p.killMu.Unlock()
 	if p.err == nil {
-		return errors.New("claude exited before it answered")
+		return newBackendError("claude", failIncomplete, "claude exited before the result")
 	}
 	return cliError("claude", p.err, p.stderr.String())
 }
@@ -290,7 +301,7 @@ func (c *ClaudeBackend) answer(ctx context.Context, p Prompt, proc *claudeProc, 
 	}
 	err := proc.exitErr()
 	if sendErr != nil && proc.err == nil {
-		err = fmt.Errorf("claude: %w", sendErr)
+		err = newBackendError("claude", failGeneric, "writing the prompt: "+sendErr.Error())
 	}
 	out <- Event{Err: err}
 	return true
@@ -328,8 +339,17 @@ type claudeLine struct {
 		Usage *claudeUsage `json:"usage"`
 	} `json:"event"`
 	Message *struct {
-		Content json.RawMessage `json:"content"`
+		Content    json.RawMessage `json:"content"`
+		StopReason string          `json:"stop_reason"`
 	} `json:"message"`
+	// Error names the provider's error an assistant message stands for.
+	Error         string `json:"error"`
+	RateLimitInfo *struct {
+		Status        string  `json:"status"`
+		ResetsAt      float64 `json:"resetsAt"` // Unix seconds
+		RateLimitType string  `json:"rateLimitType"`
+	} `json:"rate_limit_info"`
+	StopReason       string          `json:"stop_reason"`
 	ParentToolUseID  *string         `json:"parent_tool_use_id"`
 	ToolUseResult    json.RawMessage `json:"tool_use_result"`
 	IsError          bool            `json:"is_error"`
@@ -360,6 +380,9 @@ type claudeStream struct {
 	calls      int             // function calls made
 	searches   map[string]bool // tool_use ids of the running searches
 	usage      claudeUsage
+	stop       string    // stop reason of the last message
+	apiError   string    // provider error of the last assistant message
+	resets     time.Time // when a rejected usage limit is lifted
 }
 
 func (s *claudeStream) send(ev Event) { emit(s.ctx, s.out, ev) }
@@ -419,7 +442,7 @@ func (s *claudeStream) line(line []byte) bool {
 			case "text_delta":
 				s.sendText(ev.Delta.Text)
 				if s.text != nil && s.text.called {
-					return s.finish()
+					return s.finish(finishStop)
 				}
 			case "input_json_delta":
 				if idx, ok := s.blocks[ev.Index]; ok && ev.Delta.PartialJSON != "" {
@@ -434,14 +457,32 @@ func (s *claudeStream) line(line []byte) bool {
 			if ev.Usage != nil {
 				s.usage = *ev.Usage
 			}
-			// The client executes its functions: the turn ends here.
-			if ev.Delta != nil && ev.Delta.StopReason == "tool_use" && len(s.blocks) > 0 {
-				return s.finish()
+			if ev.Delta == nil || ev.Delta.StopReason == "" {
+				return false
 			}
+			s.stop = ev.Delta.StopReason
+			switch {
+			case claudeStops[s.stop] == finishLength:
+				// Stop before the CLI asks the model to resume.
+				return s.finish(finishLength)
+			case s.stop == "tool_use" && len(s.blocks) > 0:
+				// The client executes its functions: the turn ends here.
+				return s.finish(finishStop)
+			}
+		}
+	case "rate_limit_event":
+		if r := l.RateLimitInfo; r != nil && r.Status == "rejected" && r.ResetsAt > 0 {
+			s.resets = time.Unix(int64(r.ResetsAt), 0)
 		}
 	case "assistant", "user":
 		if l.Message == nil || l.ParentToolUseID != nil {
 			return false
+		}
+		if l.Type == "assistant" {
+			s.apiError = l.Error
+			if claudeStops[l.Message.StopReason] == finishLength {
+				return s.finish(finishLength)
+			}
 		}
 		var blocks []claudeBlock
 		if json.Unmarshal(l.Message.Content, &blocks) != nil {
@@ -460,12 +501,32 @@ func (s *claudeStream) line(line []byte) bool {
 			}
 		}
 	case "result":
+		if l.Usage != nil {
+			s.usage = *l.Usage
+		}
 		if l.IsError {
-			msg := l.Result
-			if msg == "" {
-				msg = l.Subtype
-			}
-			s.send(Event{Err: fmt.Errorf("claude: %s", msg)})
+			// The error is read before the exit code, which says less.
+			s.send(Event{Usage: s.usage.usage()})
+			s.send(Event{Err: s.failure(l)})
+			return true
+		}
+		// The result repeats the stop reason of the last message.
+		if l.StopReason != "" {
+			s.stop = l.StopReason
+		}
+		reason, whole := claudeStops[s.stop]
+		// A turn that ends on a tool use is whole only when that tool was
+		// the one that hands over the structured output.
+		structured := bytes.TrimSpace(l.StructuredOutput)
+		if s.stop == "tool_use" && len(structured) > 0 && !bytes.Equal(structured, []byte("null")) {
+			reason, whole = finishStop, true
+		}
+		if !whole {
+			// That the CLI calls it a success does not make it whole: a
+			// paused turn was not resumed, and a reason unknown here says
+			// nothing about the text. What was streamed stays unfinished.
+			s.send(Event{Usage: s.usage.usage()})
+			s.send(Event{Err: newBackendError("claude", failIncomplete, "result with the stop reason "+strconv.Quote(s.stop))})
 			return true
 		}
 		if s.text != nil {
@@ -481,15 +542,65 @@ func (s *claudeStream) line(line []byte) bool {
 				s.send(Event{Text: l.Result})
 			}
 		}
-		if l.Usage != nil {
-			s.usage = *l.Usage
-		}
-		return s.finish()
+		return s.finish(reason)
 	}
 	return false
 }
 
-func (s *claudeStream) finish() bool {
+// claudeStops are the stop reasons that end a turn for good, and how the
+// answer then ended. They are the provider's terminal ones. The others do
+// not attest a whole answer: tool_use and pause_turn ask for another round
+// (the CLI runs it; a result that still shows one was left there),
+// compaction is housekeeping, and whatever is not listed, or missing, is
+// unknown.
+var claudeStops = map[string]string{
+	"end_turn":                      finishStop,
+	"stop_sequence":                 finishStop,
+	"max_tokens":                    finishLength,
+	"model_context_window_exceeded": finishLength,
+	"refusal":                       finishFilter,
+}
+
+func (s *claudeStream) finish(reason string) bool {
+	if s.text != nil {
+		s.pieces(s.text.flush()) // text held back while it could be a call
+	}
 	s.send(Event{Usage: s.usage.usage()})
+	s.send(Event{Finish: reason})
 	return true
+}
+
+// claudeErrors are the provider errors the CLI names on an assistant message.
+var claudeErrors = map[string]failKind{
+	"max_output_tokens":     failOutputLimit,
+	"authentication_failed": failAuth,
+	"oauth_org_not_allowed": failAuth,
+	"billing_error":         failQuota,
+	"account_on_hold":       failQuota,
+	"rate_limit":            failRateLimit,
+	"overloaded":            failOverloaded,
+	"invalid_request":       failInvalid,
+	"model_not_found":       failInvalid,
+}
+
+// failure classifies a result that reports an error: from the provider
+// error the CLI named, or else from the text of the result.
+func (s *claudeStream) failure(l claudeLine) *BackendError {
+	text := l.Result
+	if text == "" {
+		text = l.Subtype
+	}
+	e := textFailure("claude", text)
+	if kind, ok := claudeErrors[s.apiError]; ok && (e.Kind == failGeneric || kind != failInvalid) {
+		e.Kind = kind
+	}
+	if l.StopReason == "max_tokens" {
+		e.Kind = failOutputLimit
+	}
+	// A usage limit that was refused until a known time is an allowance
+	// used up, not a matter of slowing down.
+	if (e.Kind == failRateLimit || e.Kind == failQuota) && time.Until(s.resets) > 0 {
+		e.Kind, e.RetryAfter = failQuota, time.Until(s.resets)
+	}
+	return e
 }

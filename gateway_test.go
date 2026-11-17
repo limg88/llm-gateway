@@ -262,11 +262,11 @@ func TestFallback(t *testing.T) {
 
 	// Without another target the failure reaches the client.
 	status, body = post(t, ts, "/v1/chat/completions", "", obj{"model": "claude", "messages": user("FAIL_CLAUDE")})
-	if status != 502 || !strings.Contains(string(body), "not logged in") {
+	if status != 502 || !strings.Contains(string(body), `"code":"backend_authentication_error"`) {
 		t.Errorf("status %d: %s", status, body)
 	}
 	status, body = post(t, ts, "/v1/chat/completions", "", obj{"model": "codex", "messages": user("FAIL_CODEX")})
-	if status != 502 || !strings.Contains(string(body), "model overloaded") {
+	if status != 503 || !strings.Contains(string(body), `"code":"backend_overloaded"`) {
 		t.Errorf("status %d: %s", status, body)
 	}
 }

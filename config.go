@@ -200,6 +200,9 @@ func (c *Config) validate() error {
 		if !strings.HasPrefix(u.BaseURL, "http://") && !strings.HasPrefix(u.BaseURL, "https://") {
 			return fmt.Errorf("upstream %q: base_url must be an http(s) URL", u.Name)
 		}
+		if !oneOf(u.MaxTokensField, []string{"", "max_tokens", "max_completion_tokens"}) {
+			return fmt.Errorf("upstream %q: max_tokens_field must be max_tokens or max_completion_tokens", u.Name)
+		}
 		reserved[u.Name] = true
 	}
 	for _, b := range c.Backends {

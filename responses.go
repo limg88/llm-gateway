@@ -4,7 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
-	"log/slog"
+	"iter"
 	"net/http"
 	"strings"
 	"time"
@@ -20,6 +20,10 @@ func (req ResponsesRequest) chatRequest() (chat ChatCompletionRequest, sources b
 		ToolChoice:        req.ToolChoice,
 		ParallelToolCalls: req.ParallelToolCalls,
 	}
+	if _, aerr := outputBudget("max_output_tokens", req.MaxOutputTokens); aerr != nil {
+		return chat, false, aerr
+	}
+	chat.MaxTokens = req.MaxOutputTokens
 	if req.Reasoning != nil {
 		chat.ReasoningEffort = req.Reasoning.Effort
 	}
@@ -161,31 +165,50 @@ func (s *Server) handleResponses(w http.ResponseWriter, r *http.Request) {
 	}()
 
 	if req.Stream {
-		s.streamResponse(w, events, &a, resp, sources)
+		first, err := early(ctx, events, &a)
+		if err != nil {
+			writeAPIErr(w, publicError(err))
+			return
+		}
+		s.streamResponse(w, replay(first, events), &a, resp, sources)
 		return
 	}
 	for ev := range events {
 		a.add(ev)
 	}
 	if a.err != nil {
-		writeBackendError(w, a.err)
+		writeAPIErr(w, publicError(a.err))
 		return
 	}
+	resp.end(&a)
 	for _, ws := range a.searches {
 		ws.Done = true
 		resp.Output = append(resp.Output, searchItem(ws, sources))
 	}
 	if text := a.text.String(); text != "" || len(a.calls) == 0 {
-		item := messageItem(text, "completed")
+		item := messageItem(text, resp.Status)
 		(*item.Content)[0].Annotations = annotationsOf(text, a.searches)
 		resp.Output = append(resp.Output, item)
 	}
 	for _, tc := range a.calls {
-		resp.Output = append(resp.Output, functionCallItem(tc, "completed"))
+		resp.Output = append(resp.Output, functionCallItem(tc, resp.Status))
 	}
-	resp.Status = "completed"
-	resp.Usage = responsesUsage(a.usage)
 	writeJSON(w, http.StatusOK, resp)
+}
+
+// end sets the final status of a response from the way its answer ended:
+// an answer cut short is "incomplete", with the reason.
+func (resp *Response) end(a *answer) {
+	resp.Status = "completed"
+	switch a.reason() {
+	case finishLength:
+		resp.Status = "incomplete"
+		resp.IncompleteDetails = &IncompleteDetails{Reason: "max_output_tokens"}
+	case finishFilter:
+		resp.Status = "incomplete"
+		resp.IncompleteDetails = &IncompleteDetails{Reason: "content_filter"}
+	}
+	resp.Usage = responsesUsage(a.usage)
 }
 
 func annotationsOf(text string, searches []SearchEvent) []URLCitation {
@@ -255,6 +278,8 @@ type responseSSE struct {
 	buf    strings.Builder
 
 	ws map[string]int // search id -> output index of the open search item
+
+	status string // of the items closed from now on: completed or incomplete
 
 	fc     map[int]*OutputItem // call index -> open function call item
 	fcIdx  map[int]int
@@ -348,7 +373,7 @@ func (r *responseSSE) endText(searches []SearchEvent) {
 	r.send("response.content_part.done", map[string]any{
 		"item_id": item.ID, "output_index": r.msgIdx, "content_index": 0, "part": part,
 	})
-	item.Status = "completed"
+	item.Status = r.status
 	item.Content = &[]OutputText{part}
 	r.done(r.msgIdx, item)
 	r.msg = nil
@@ -386,15 +411,15 @@ func (r *responseSSE) endCall(index int) {
 	}
 	r.send("response.function_call_arguments.done", map[string]any{"item_id": item.ID, "output_index": idx, "arguments": args})
 	done := *item
-	done.Status = "completed"
+	done.Status = r.status
 	done.Arguments = &args
 	r.done(idx, done)
 	delete(r.fc, index)
 }
 
-func (s *Server) streamResponse(w http.ResponseWriter, events <-chan Event, a *answer, resp *Response, sources bool) {
+func (s *Server) streamResponse(w http.ResponseWriter, events iter.Seq[Event], a *answer, resp *Response, sources bool) {
 	r := &responseSSE{
-		sse: startSSE(w), resp: resp, sources: sources,
+		sse: startSSE(w), resp: resp, sources: sources, status: "completed",
 		ws: map[string]int{}, fc: map[int]*OutputItem{}, fcIdx: map[int]int{}, fcArgs: map[int]*strings.Builder{},
 	}
 	r.send("response.created", map[string]any{"response": resp})
@@ -403,9 +428,9 @@ func (s *Server) streamResponse(w http.ResponseWriter, events <-chan Event, a *a
 		a.add(ev)
 		switch {
 		case ev.Err != nil:
-			slog.Error("backend error during stream", "err", ev.Err)
+			e := publicError(ev.Err)
 			resp.Status = "failed"
-			resp.Error = &ResponseError{Code: "server_error", Message: backendMessage(ev.Err)}
+			resp.Error = &ResponseError{Code: e.code, Message: e.msg, RetryAfter: e.retrySeconds()}
 			r.send("response.failed", map[string]any{"response": resp})
 			return
 		case ev.Search != nil:
@@ -416,7 +441,10 @@ func (s *Server) streamResponse(w http.ResponseWriter, events <-chan Event, a *a
 			r.text(ev.Text)
 		}
 	}
-	// Close whatever the backend left open.
+	resp.end(a)
+	// Close whatever the backend left open. What was open when the answer
+	// was cut short is incomplete, like the response.
+	final := resp.Status
 	for id, idx := range r.ws {
 		for _, ws := range a.searches {
 			if ws.ID == id {
@@ -427,15 +455,13 @@ func (s *Server) streamResponse(w http.ResponseWriter, events <-chan Event, a *a
 			}
 		}
 	}
+	r.status = final
+	if len(resp.Output) == 0 {
+		r.text("")
+	}
 	r.endText(a.searches)
 	for index := range r.fc {
 		r.endCall(index)
 	}
-	if len(resp.Output) == 0 {
-		r.text("")
-		r.endText(nil)
-	}
-	resp.Status = "completed"
-	resp.Usage = responsesUsage(a.usage)
-	r.send("response.completed", map[string]any{"response": resp})
+	r.send("response."+final, map[string]any{"response": resp})
 }

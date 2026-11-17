@@ -365,6 +365,10 @@ func TestClaudeArgs(t *testing.T) {
 	if poolKey("a", Prompt{System: "x"}) == poolKey("a", Prompt{System: "y"}) || poolKey("a", Prompt{Text: "1"}) != poolKey("a", Prompt{Text: "2"}) {
 		t.Error("the pool key must depend on the command line only")
 	}
+	// The output budget is in the environment of the process.
+	if poolKey("a", Prompt{MaxTokens: 100}) == poolKey("a", Prompt{MaxTokens: 200}) || poolKey("a", Prompt{}) == poolKey("a", Prompt{MaxTokens: 100}) {
+		t.Error("the pool key must depend on the output budget")
+	}
 }
 
 func TestConfig(t *testing.T) {
@@ -400,6 +404,7 @@ func TestConfig(t *testing.T) {
 		"reserved name":    `{"upstreams": [{"name": "claude", "base_url": "http://x"}]}`,
 		"empty alias":      `{"models": {"x": []}}`,
 		"unknown backend":  `{"backends": ["gemini"]}`,
+		"budget field":     `{"upstreams": [{"name": "x", "base_url": "http://x", "max_tokens_field": "max_output_tokens"}]}`,
 		"zero concurrency": `{"max_concurrency": 0}`,
 		"unsafe codex arg": `{"codex_extra_args": ["--sandbox=danger-full-access"]}`,
 		"codex bypass":     `{"codex_extra_args": ["--dangerously-bypass-approvals-and-sandbox"]}`,

@@ -16,6 +16,16 @@ import (
 // CodexBackend answers with the codex CLI, one `codex exec` per request, in
 // a read-only sandbox. Codex reports whole messages, not text deltas.
 //
+// Codex has no setting for an output budget, so the budget is checked
+// afterwards: the answer is held back until the turn reports its usage, and
+// one whose output tokens (reasoning included, as the OpenAI API counts
+// them) exceed the budget is refused whole. Its text is never cut to fit.
+//
+// Codex has no setting for an output budget, so the budget is checked
+// afterwards: the answer is held back until the turn reports its usage, and
+// one whose output tokens (reasoning included, as the OpenAI API counts
+// them) exceed the budget is refused whole. Its text is never cut to fit.
+//
 // Codex is a coding agent: left as it is, it runs shell commands and uses
 // the MCP servers and plugins of the user's configuration, and its read-only
 // sandbox still lets it read every file the user can. A client could then
@@ -190,7 +200,7 @@ func (c *CodexBackend) Run(ctx context.Context, model string, p Prompt) <-chan E
 		if c.Home != "" {
 			features, err := c.enabledFeatures(ctx)
 			if err != nil {
-				out <- Event{Err: err}
+				out <- Event{Err: newBackendError("codex", failGeneric, err.Error())}
 				return
 			}
 			for _, f := range features {
@@ -209,14 +219,14 @@ func (c *CodexBackend) Run(ctx context.Context, model string, p Prompt) <-chan E
 				}
 			}
 			if err != nil {
-				out <- Event{Err: fmt.Errorf("writing output schema: %w", err)}
+				out <- Event{Err: newBackendError("codex", failGeneric, "writing the output schema: "+err.Error())}
 				return
 			}
 			args = append(args, "--output-schema", f.Name())
 		}
 		paths, remove, err := imageFiles(p.Images)
 		if err != nil {
-			out <- Event{Err: err}
+			out <- Event{Err: newBackendError("codex", failGeneric, err.Error())}
 			return
 		}
 		defer remove()
@@ -239,8 +249,23 @@ func (c *CodexBackend) Run(ctx context.Context, model string, p Prompt) <-chan E
 		if c.Home != "" {
 			cmd.Env = append(os.Environ(), "CODEX_HOME="+c.Home)
 		}
-		answered, ended, lastErr := false, false, ""
-		runJSONL(ctx, cmd, text, out, func(line []byte) bool {
+		var (
+			answered, ended bool
+			lastErr         string
+			held            []string // messages kept until the budget is checked
+		)
+		say := func(text string) {
+			if answered {
+				text = "\n\n" + text
+			}
+			answered = true
+			if p.MaxTokens > 0 {
+				held = append(held, text)
+				return
+			}
+			emit(ctx, out, Event{Text: text})
+		}
+		runErr := runJSONL(ctx, "codex", cmd, text, func(line []byte) bool {
 			var l codexLine
 			if json.Unmarshal(line, &l) != nil {
 				return false
@@ -253,11 +278,7 @@ func (c *CodexBackend) Run(ctx context.Context, model string, p Prompt) <-chan E
 				switch l.Item.Type {
 				case "agent_message":
 					if l.Type == "item.completed" && l.Item.Text != "" {
-						if answered {
-							emit(ctx, out, Event{Text: "\n\n"})
-						}
-						answered = true
-						emit(ctx, out, Event{Text: l.Item.Text})
+						say(l.Item.Text)
 					}
 				case "web_search":
 					action := &WebSearchAction{Type: "search", Query: l.Item.Query}
@@ -267,14 +288,25 @@ func (c *CodexBackend) Run(ctx context.Context, model string, p Prompt) <-chan E
 					emit(ctx, out, Event{Search: &SearchEvent{ID: l.Item.ID, Done: l.Type == "item.completed", Action: action}})
 				}
 			case "turn.completed":
+				ended = true
+				output := 0
 				if u := l.Usage; u != nil {
+					output = u.OutputTokens
 					emit(ctx, out, Event{Usage: &Usage{
 						PromptTokens:     u.InputTokens,
 						CompletionTokens: u.OutputTokens,
 						TotalTokens:      u.InputTokens + u.OutputTokens,
 					}})
 				}
-				ended = true
+				if p.MaxTokens > 0 && output > p.MaxTokens {
+					emit(ctx, out, Event{Err: newBackendError("codex", failOutputLimit,
+						fmt.Sprintf("%d output tokens against a budget of %d", output, p.MaxTokens))})
+					return true
+				}
+				for _, text := range held {
+					emit(ctx, out, Event{Text: text})
+				}
+				emit(ctx, out, Event{Finish: finishStop})
 				return true
 			case "turn.failed", "error":
 				msg := l.Message
@@ -291,13 +323,23 @@ func (c *CodexBackend) Run(ctx context.Context, model string, p Prompt) <-chan E
 					return false
 				}
 				ended = true
-				emit(ctx, out, Event{Err: errors.New("codex: " + msg)})
+				emit(ctx, out, Event{Err: textFailure("codex", msg)})
 				return true
 			}
 			return false
 		})
-		if !ended && !answered && lastErr != "" && ctx.Err() == nil {
-			out <- Event{Err: errors.New("codex: " + lastErr)}
+		// Only turn.completed ends an answer: a codex that stops before it,
+		// whatever it wrote so far, did not finish.
+		switch {
+		case ended:
+		case ctx.Err() != nil:
+			out <- Event{Err: ctx.Err()}
+		case lastErr != "":
+			out <- Event{Err: textFailure("codex", lastErr)}
+		case runErr != nil:
+			out <- Event{Err: runErr}
+		default:
+			out <- Event{Err: newBackendError("codex", failIncomplete, "codex exited before the turn was completed")}
 		}
 	}()
 	return out

@@ -7,8 +7,6 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
-	"errors"
-	"fmt"
 	"io"
 	"os/exec"
 	"strings"
@@ -27,6 +25,11 @@ type Prompt struct {
 	WebSearch bool
 	Functions []FunctionDefinition
 	Effort    string
+	// MaxTokens is the output budget in tokens, zero for none. How it is
+	// applied depends on the backend: see each one. MaxTokensField is the
+	// name a Chat Completions client gave it, for the pass-through backends.
+	MaxTokens      int
+	MaxTokensField string
 
 	Messages   []ChatMessage
 	Tools      []Tool
@@ -59,16 +62,19 @@ type CallEvent struct {
 }
 
 // Event is one item of a backend's output stream. Exactly one field is set.
+// Finish is one of the finish* reasons.
 type Event struct {
 	Text   string
 	Usage  *Usage
 	Err    error
 	Search *SearchEvent
 	Call   *CallEvent
+	Finish string
 }
 
-// Backend runs a prompt and streams the answer. The returned channel is
-// closed when the answer is complete; an error arrives as an Event.
+// Backend runs a prompt and streams the answer. An answer ends with a
+// Finish event or with an error, which arrives as an Event too; then the
+// channel is closed. A channel closed without either is a broken answer.
 type Backend interface {
 	Name() string
 	// NativeFunctions reports whether the backend calls the client's
@@ -115,20 +121,18 @@ const maxStderr = 64 << 10
 
 // runJSONL starts cmd, writes stdin to it and calls onLine for every line of
 // its standard output. onLine returns true when the answer is complete: the
-// process is then stopped. Any failure is sent to out.
-func runJSONL(ctx context.Context, cmd *exec.Cmd, stdin string, out chan<- Event, onLine func([]byte) bool) {
-	name := cmd.Args[0]
+// process is then stopped. It returns the failure of the process, if any;
+// a process that just ends early is the caller's to judge.
+func runJSONL(ctx context.Context, name string, cmd *exec.Cmd, stdin string, onLine func([]byte) bool) error {
 	var stderr bytes.Buffer
 	cmd.Stdin = strings.NewReader(stdin)
 	cmd.Stderr = &limitedWriter{w: &stderr, n: maxStderr}
 	stdout, err := cmd.StdoutPipe()
-	if err != nil {
-		emit(ctx, out, Event{Err: fmt.Errorf("starting %s: %w", name, err)})
-		return
+	if err == nil {
+		err = cmd.Start()
 	}
-	if err := cmd.Start(); err != nil {
-		emit(ctx, out, Event{Err: fmt.Errorf("starting %s: %w", name, err)})
-		return
+	if err != nil {
+		return newBackendError(name, failGeneric, "starting the CLI: "+err.Error())
 	}
 	stopped := false
 	r := bufio.NewReaderSize(stdout, 64<<10)
@@ -146,17 +150,19 @@ func runJSONL(ctx context.Context, cmd *exec.Cmd, stdin string, out chan<- Event
 		cmd.Process.Kill()
 		io.Copy(io.Discard, stdout)
 		cmd.Wait()
-		return
+		return nil
 	}
 	if err := cmd.Wait(); err != nil {
 		if ctx.Err() != nil {
-			emit(context.Background(), out, Event{Err: ctx.Err()})
-			return
+			return ctx.Err()
 		}
-		out <- Event{Err: cliError(name, err, stderr.String())}
+		return cliError(name, err, stderr.String())
 	}
+	return nil
 }
 
+// cliError classifies the failure of a CLI from the end of its standard
+// error, where the reason is.
 func cliError(name string, err error, stderr string) error {
 	msg := strings.TrimSpace(stderr)
 	if msg == "" {
@@ -165,7 +171,7 @@ func cliError(name string, err error, stderr string) error {
 	if len(msg) > 2000 {
 		msg = msg[len(msg)-2000:]
 	}
-	return fmt.Errorf("%s failed: %s", name, msg)
+	return textFailure(name, msg)
 }
 
 func randomID() string {
@@ -173,5 +179,3 @@ func randomID() string {
 	rand.Read(b[:])
 	return hex.EncodeToString(b[:])
 }
-
-var errNoOutput = errors.New("the backend returned no output")

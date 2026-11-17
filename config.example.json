@@ -26,7 +26,8 @@
       "name": "openai",
       "base_url": "https://api.openai.com/v1",
       "api_key_env": "OPENAI_API_KEY",
-      "models": ["gpt-5"]
+      "models": ["gpt-5"],
+      "max_tokens_field": "max_completion_tokens"
     }
   ],
 

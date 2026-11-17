@@ -4,7 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
-	"log/slog"
+	"iter"
 	"net/http"
 	"strings"
 	"time"
@@ -19,8 +19,9 @@ type MessagesRequest struct {
 		Role    string          `json:"role"`
 		Content json.RawMessage `json:"content"`
 	} `json:"messages"`
-	Stream bool `json:"stream"`
-	Tools  []struct {
+	Stream    bool `json:"stream"`
+	MaxTokens *int `json:"max_tokens"`
+	Tools     []struct {
 		Type        string          `json:"type"`
 		Name        string          `json:"name"`
 		Description string          `json:"description"`
@@ -65,7 +66,7 @@ type MessagesResponse struct {
 
 // chatRequest converts a Messages request to the chat form.
 func (req MessagesRequest) chatRequest() (ChatCompletionRequest, *apiErr) {
-	chat := ChatCompletionRequest{Model: req.Model, Stream: req.Stream}
+	chat := ChatCompletionRequest{Model: req.Model, Stream: req.Stream, MaxTokens: req.MaxTokens}
 
 	if sys := bytes.TrimSpace(req.System); len(sys) > 0 && !bytes.Equal(sys, []byte("null")) {
 		text, _, err := parseContent(sys, "system", 0)
@@ -146,12 +147,17 @@ func (req MessagesRequest) chatRequest() (ChatCompletionRequest, *apiErr) {
 	return chat, nil
 }
 
-func writeAnthropicError(w http.ResponseWriter, status int, typ, msg string) {
-	writeJSON(w, status, map[string]any{"type": "error", "error": map[string]any{"type": typ, "message": msg}})
-}
-
-func writeAnthropicAPIErr(w http.ResponseWriter, e *apiErr) {
-	writeAnthropicError(w, e.status, e.typ, e.msg)
+// anthropicStop is a finish reason in the words of the Messages API.
+func anthropicStop(finish string) string {
+	switch finish {
+	case finishLength:
+		return "max_tokens"
+	case finishToolCalls:
+		return "tool_use"
+	case finishFilter:
+		return "refusal"
+	}
+	return "end_turn"
 }
 
 func toolUseBlock(tc ToolCall) anthropicBlock {
@@ -193,28 +199,28 @@ func (s *Server) handleMessages(w http.ResponseWriter, r *http.Request) {
 
 	resp := MessagesResponse{ID: "msg_" + randomID(), Type: "message", Role: "assistant", Model: req.Model, Content: []anthropicBlock{}}
 	if req.Stream {
-		s.streamMessages(w, events, &a, resp)
+		first, err := early(ctx, events, &a)
+		if err != nil {
+			writeAnthropicAPIErr(w, publicError(err))
+			return
+		}
+		s.streamMessages(w, replay(first, events), &a, resp)
 		return
 	}
 	for ev := range events {
 		a.add(ev)
 	}
 	if a.err != nil {
-		status, typ := http.StatusBadGateway, "api_error"
-		if backendMessage(a.err) == "backend timed out" {
-			status, typ = http.StatusGatewayTimeout, "timeout_error"
-		}
-		writeAnthropicError(w, status, typ, backendMessage(a.err))
+		writeAnthropicAPIErr(w, publicError(a.err))
 		return
 	}
 	if text := a.text.String(); text != "" || len(a.calls) == 0 {
 		resp.Content = append(resp.Content, anthropicBlock{Type: "text", Text: text})
 	}
-	stop := "end_turn"
 	for _, tc := range a.calls {
-		stop = "tool_use"
 		resp.Content = append(resp.Content, toolUseBlock(tc))
 	}
+	stop := anthropicStop(a.reason())
 	resp.StopReason = &stop
 	if a.usage != nil {
 		resp.Usage = anthropicUsage{InputTokens: a.usage.PromptTokens, OutputTokens: a.usage.CompletionTokens}
@@ -222,7 +228,7 @@ func (s *Server) handleMessages(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, resp)
 }
 
-func (s *Server) streamMessages(w http.ResponseWriter, events <-chan Event, a *answer, resp MessagesResponse) {
+func (s *Server) streamMessages(w http.ResponseWriter, events iter.Seq[Event], a *answer, resp MessagesResponse) {
 	sse := startSSE(w)
 	send := func(typ string, fields map[string]any) {
 		fields["type"] = typ
@@ -260,8 +266,8 @@ func (s *Server) streamMessages(w http.ResponseWriter, events <-chan Event, a *a
 		a.add(ev)
 		switch {
 		case ev.Err != nil:
-			slog.Error("backend error during stream", "err", ev.Err)
-			send("error", map[string]any{"error": map[string]any{"type": "api_error", "message": backendMessage(ev.Err)}})
+			// No message_delta and no message_stop: the message is not whole.
+			send("error", map[string]any{"error": publicError(ev.Err).anthropicBody()})
 			return
 		case ev.Text != "":
 			if !textOpen {
@@ -282,10 +288,7 @@ func (s *Server) streamMessages(w http.ResponseWriter, events <-chan Event, a *a
 		index, textOpen = 1, true
 	}
 	closeText()
-	stop := "end_turn"
-	if len(a.calls) > 0 {
-		stop = "tool_use"
-	}
+	stop := anthropicStop(a.reason())
 	usage := anthropicUsage{}
 	if a.usage != nil {
 		usage = anthropicUsage{InputTokens: a.usage.PromptTokens, OutputTokens: a.usage.CompletionTokens}

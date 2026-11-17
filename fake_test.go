@@ -18,6 +18,9 @@ import (
 
 const fakeEnv = "LLM_GATEWAY_FAKE_CLI"
 
+// fakeSecret stands for a credential a backend lets slip in its errors.
+const fakeSecret = "sk-test-0123456789abcdefSECRET"
+
 func TestMain(m *testing.M) {
 	if os.Getenv(fakeEnv) != "" && len(os.Args) > 1 {
 		switch os.Args[1] {
@@ -104,6 +107,65 @@ func fakeClaude(args []string) {
 	case strings.Contains(prompt, "FAIL_CLAUDE"):
 		fmt.Fprintln(os.Stderr, "boom: not logged in")
 		os.Exit(1)
+	case strings.Contains(prompt, "SECRET_FAIL"):
+		fmt.Fprintln(os.Stderr, "401 Unauthorized: Authorization: Bearer "+fakeSecret+" was refused for the prompt SECRET_FAIL")
+		os.Exit(1)
+	case strings.Contains(prompt, "TRUNCATE"):
+		// The provider cuts the generation; the real CLI then asks the
+		// model to resume and reports the whole as a success, whose
+		// result is the tail alone.
+		streamEvent(map[string]any{"type": "message_start"})
+		streamEvent(map[string]any{"type": "content_block_delta", "index": 0, "delta": map[string]any{"type": "text_delta", "text": "The first half"}})
+		streamEvent(map[string]any{"type": "message_delta", "delta": map[string]any{"stop_reason": "max_tokens"}, "usage": usage})
+		text(" and the TAIL")
+		result(map[string]any{"result": " and the TAIL"})
+		time.Sleep(30 * time.Second)
+	case strings.Contains(prompt, "LIMIT_RESULT"):
+		// As observed: a "success" that is an error, then exit code 1.
+		result(map[string]any{"is_error": true, "stop_reason": "stop_sequence",
+			"result": "API Error: Claude's response exceeded the 2200 output token maximum. To configure this behavior, set the CLAUDE_CODE_MAX_OUTPUT_TOKENS environment variable."})
+		os.Exit(1)
+	case strings.Contains(prompt, "USAGE_LIMIT"):
+		say(map[string]any{"type": "rate_limit_event", "rate_limit_info": map[string]any{
+			"status": "rejected", "resetsAt": time.Now().Add(time.Hour).Unix(), "rateLimitType": "five_hour"}})
+		say(map[string]any{"type": "assistant", "error": "rate_limit", "message": map[string]any{"content": []any{}}})
+		result(map[string]any{"is_error": true, "result": "Claude usage limit reached"})
+		os.Exit(1)
+	case strings.Contains(prompt, "TOO_LONG"):
+		say(map[string]any{"type": "assistant", "error": "invalid_request", "message": map[string]any{"content": []any{}}})
+		result(map[string]any{"is_error": true, "result": "Prompt is too long"})
+		os.Exit(1)
+	case strings.Contains(prompt, "REFUSE"):
+		streamEvent(map[string]any{"type": "message_start"})
+		streamEvent(map[string]any{"type": "content_block_delta", "index": 0, "delta": map[string]any{"type": "text_delta", "text": "I can"}})
+		streamEvent(map[string]any{"type": "message_delta", "delta": map[string]any{"stop_reason": "refusal"}, "usage": usage})
+		result(nil)
+	case strings.Contains(prompt, "STOP_AS:"):
+		// A result the CLI calls a success, after a last message that
+		// stopped for the given reason ("none" for no reason at all).
+		_, stop, _ := strings.Cut(prompt, "STOP_AS:")
+		stop = strings.Fields(stop)[0]
+		streamEvent(map[string]any{"type": "message_start"})
+		streamEvent(map[string]any{"type": "content_block_delta", "index": 0, "delta": map[string]any{"type": "text_delta", "text": "Half an"}})
+		extra := map[string]any{}
+		switch {
+		case stop == "none":
+		case strings.HasPrefix(stop, "result="):
+			// Only the result names the stop reason.
+			extra["stop_reason"] = strings.TrimPrefix(stop, "result=")
+		default:
+			streamEvent(map[string]any{"type": "message_delta", "delta": map[string]any{"stop_reason": stop}, "usage": usage})
+		}
+		if _, ok := argValue(args, "--json-schema"); ok {
+			extra["structured_output"] = map[string]any{"ok": true}
+		}
+		result(extra)
+		if stop == "model_context_window_exceeded" {
+			time.Sleep(30 * time.Second) // the gateway must not wait for it
+		}
+	case strings.Contains(prompt, "DIE_MIDWAY"):
+		streamEvent(map[string]any{"type": "message_start"})
+		streamEvent(map[string]any{"type": "content_block_delta", "index": 0, "delta": map[string]any{"type": "text_delta", "text": "Half an"}})
 	case strings.Contains(prompt, "SLOW"):
 		time.Sleep(30 * time.Second)
 	case strings.Contains(prompt, "CALL_TOOL"):
@@ -131,7 +193,7 @@ func fakeClaude(args []string) {
 		text("See ", "[Go 1.27](https://go.dev/doc/go1.27).")
 		result(nil)
 	case strings.Contains(prompt, "ECHO"):
-		text(fmt.Sprintf("system=%q images=%d prompt=%s", system, images, prompt))
+		text(fmt.Sprintf("system=%q images=%d budget=%q prompt=%s", system, images, os.Getenv("CLAUDE_CODE_MAX_OUTPUT_TOKENS"), prompt))
 		result(nil)
 	default:
 		if _, ok := argValue(args, "--json-schema"); ok {
@@ -157,6 +219,11 @@ func fakeCodex(args []string) {
 	switch {
 	case strings.Contains(prompt, "FAIL_CODEX"):
 		say(map[string]any{"type": "turn.failed", "error": map[string]any{"message": "model overloaded"}})
+	case strings.Contains(prompt, "RATE_CODEX"):
+		say(map[string]any{"type": "error", "message": "Rate limit reached for requests. Please try again in 20s."})
+		say(map[string]any{"type": "turn.failed", "error": map[string]any{"message": "Rate limit reached for requests. Please try again in 20s."}})
+	case strings.Contains(prompt, "DIE_MIDWAY"):
+		say(map[string]any{"type": "item.completed", "item": map[string]any{"id": "item_0", "type": "agent_message", "text": "Half an"}})
 	case strings.Contains(prompt, "ECHO"):
 		message("home=" + os.Getenv("CODEX_HOME") + " args=" + strings.Join(args, " ") + " prompt=" + prompt)
 	case schema && strings.Contains(prompt, "CALL_TOOL"):

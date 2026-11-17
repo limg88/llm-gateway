@@ -58,6 +58,30 @@ type ChatCompletionRequest struct {
 	ReasoningEffort   string          `json:"reasoning_effort,omitempty"`
 	WebSearchOptions  json.RawMessage `json:"web_search_options,omitempty"`
 	ResponseFormat    *ResponseFormat `json:"response_format,omitempty"`
+	// The output budget, under its old and its current name.
+	MaxTokens           *int `json:"max_tokens,omitempty"`
+	MaxCompletionTokens *int `json:"max_completion_tokens,omitempty"`
+}
+
+// budget returns the output budget of the request, zero for none, and the
+// name the client gave it. With both names the values must agree.
+func (req ChatCompletionRequest) budget() (tokens int, field string, aerr *apiErr) {
+	old, aerr := outputBudget("max_tokens", req.MaxTokens)
+	if aerr != nil {
+		return 0, "", aerr
+	}
+	tokens, aerr = outputBudget("max_completion_tokens", req.MaxCompletionTokens)
+	switch {
+	case aerr != nil:
+		return 0, "", aerr
+	case tokens == 0 && old == 0:
+		return 0, "", nil
+	case tokens == 0:
+		return old, "max_tokens", nil
+	case old != 0 && old != tokens:
+		return 0, "", badRequest("max_tokens and max_completion_tokens differ: send only one")
+	}
+	return tokens, "max_completion_tokens", nil
 }
 
 type Usage struct {
@@ -144,6 +168,9 @@ type APIErrorBody struct {
 	Message string `json:"message"`
 	Type    string `json:"type"`
 	Code    string `json:"code,omitempty"`
+	// RetryAfter is the Retry-After header again, in seconds: inside an
+	// event stream there is no header to carry it.
+	RetryAfter int `json:"retry_after,omitempty"`
 }
 
 type APIError struct {
@@ -189,7 +216,8 @@ type ResponsesRequest struct {
 			Schema json.RawMessage `json:"schema"`
 		} `json:"format"`
 	} `json:"text,omitempty"`
-	Include []string `json:"include,omitempty"`
+	Include         []string `json:"include,omitempty"`
+	MaxOutputTokens *int     `json:"max_output_tokens,omitempty"`
 }
 
 type WebSearchSource struct {
@@ -229,18 +257,24 @@ type ResponsesUsage struct {
 }
 
 type ResponseError struct {
-	Code    string `json:"code"`
-	Message string `json:"message"`
+	Code       string `json:"code"`
+	Message    string `json:"message"`
+	RetryAfter int    `json:"retry_after,omitempty"`
+}
+
+type IncompleteDetails struct {
+	Reason string `json:"reason"` // max_output_tokens or content_filter
 }
 
 type Response struct {
-	ID                 string          `json:"id"`
-	Object             string          `json:"object"`
-	CreatedAt          int64           `json:"created_at"`
-	Status             string          `json:"status"`
-	Model              string          `json:"model"`
-	Output             []OutputItem    `json:"output"`
-	PreviousResponseID string          `json:"previous_response_id,omitempty"`
-	Usage              *ResponsesUsage `json:"usage,omitempty"`
-	Error              *ResponseError  `json:"error"`
+	ID                 string             `json:"id"`
+	Object             string             `json:"object"`
+	CreatedAt          int64              `json:"created_at"`
+	Status             string             `json:"status"`
+	Model              string             `json:"model"`
+	Output             []OutputItem       `json:"output"`
+	PreviousResponseID string             `json:"previous_response_id,omitempty"`
+	Usage              *ResponsesUsage    `json:"usage,omitempty"`
+	Error              *ResponseError     `json:"error"`
+	IncompleteDetails  *IncompleteDetails `json:"incomplete_details"`
 }

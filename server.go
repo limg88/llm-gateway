@@ -8,10 +8,10 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"iter"
 	"log/slog"
 	"net/http"
 	"os/exec"
-	"strconv"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -170,15 +170,15 @@ func (s *Server) auth(next http.Handler) http.Handler {
 			}
 			if key == nil {
 				s.metrics.Inc("llm_gateway_rejected_total", "reason", "unauthorized")
-				writeError(w, http.StatusUnauthorized, "invalid_request_error", "invalid API key")
+				writeAPIErr(w, &apiErr{status: http.StatusUnauthorized, typ: "authentication_error", code: "authentication_error", msg: "invalid API key"})
 				return
 			}
 		}
 		if key.limiter != nil {
 			if ok, wait := key.limiter.allow(); !ok {
 				s.metrics.Inc("llm_gateway_rejected_total", "reason", "rate_limited")
-				w.Header().Set("Retry-After", strconv.Itoa(int(wait.Seconds())+1))
-				writeError(w, http.StatusTooManyRequests, "rate_limit_error", fmt.Sprintf("rate limit of %d requests per minute exceeded", key.RPM))
+				writeAPIErr(w, &apiErr{status: http.StatusTooManyRequests, typ: "rate_limit_error", code: "gateway_rate_limit",
+					msg: fmt.Sprintf("rate limit of %d requests per minute exceeded", key.RPM), retryAfter: wait})
 				return
 			}
 		}
@@ -219,7 +219,7 @@ func logRequests(next http.Handler) http.Handler {
 			if v := recover(); v != nil {
 				slog.Error("panic", "path", r.URL.Path, "err", v)
 				if sw.status == 0 {
-					writeError(sw, http.StatusInternalServerError, "server_error", "internal error")
+					writeAPIErr(sw, &apiErr{status: http.StatusInternalServerError, typ: "server_error", code: "internal_error", msg: "internal error"})
 				}
 			}
 			level := slog.LevelInfo
@@ -240,16 +240,6 @@ type target struct {
 	backend Backend
 	model   string // as the backend knows it, possibly empty for its default
 	label   string // backend/model
-}
-
-type apiErr struct {
-	status int
-	typ    string
-	msg    string
-}
-
-func badRequest(format string, args ...any) *apiErr {
-	return &apiErr{http.StatusBadRequest, "invalid_request_error", fmt.Sprintf(format, args...)}
 }
 
 // resolveModel turns a model name into the targets to try, in order: the
@@ -280,7 +270,7 @@ func (s *Server) resolveModel(name string, key *apiKey) ([]target, *apiErr) {
 	}
 	if len(targets) == 0 {
 		if denied {
-			return nil, &apiErr{http.StatusForbidden, "permission_error", fmt.Sprintf("this API key cannot use model %q", name)}
+			return nil, &apiErr{status: http.StatusForbidden, typ: "permission_error", code: "permission_denied", msg: fmt.Sprintf("this API key cannot use model %q", name)}
 		}
 		return nil, badRequest("model %q has no usable target", name)
 	}
@@ -385,6 +375,9 @@ func (s *Server) prepare(endpoint string, req ChatCompletionRequest, key *apiKey
 		return nil, badRequest("%s", err)
 	}
 	base.Effort = req.ReasoningEffort
+	if base.MaxTokens, base.MaxTokensField, aerr = req.budget(); aerr != nil {
+		return nil, aerr
+	}
 	if ws := bytes.TrimSpace(req.WebSearchOptions); len(ws) > 0 && !bytes.Equal(ws, []byte("null")) {
 		base.WebSearch = true
 	}
@@ -412,7 +405,7 @@ func (s *Server) prepare(endpoint string, req ChatCompletionRequest, key *apiKey
 	}
 	slog.Info("completion", "endpoint", endpoint, "key", key.Name, "model", req.Model, "targets", len(j.targets),
 		"stream", req.Stream, "functions", len(req.Tools), "emulated", j.targets[0].emulated,
-		"web_search", base.WebSearch, "effort", req.ReasoningEffort, "images", len(base.Images))
+		"web_search", base.WebSearch, "effort", req.ReasoningEffort, "images", len(base.Images), "max_tokens", base.MaxTokens)
 	return j, nil
 }
 
@@ -443,7 +436,7 @@ func (s *Server) run(ctx context.Context, j *job) (<-chan Event, *apiErr) {
 	default:
 		if int(s.queued.Load()) >= s.cfg.MaxQueue {
 			s.metrics.Inc("llm_gateway_rejected_total", "reason", "queue_full")
-			return nil, &apiErr{http.StatusServiceUnavailable, "overloaded_error", "the server is at capacity, retry later"}
+			return nil, busy("the server is at capacity, retry later")
 		}
 		s.queued.Add(1)
 		select {
@@ -452,7 +445,7 @@ func (s *Server) run(ctx context.Context, j *job) (<-chan Event, *apiErr) {
 		case <-ctx.Done():
 			s.queued.Add(-1)
 			s.metrics.Inc("llm_gateway_rejected_total", "reason", "queue_timeout")
-			return nil, &apiErr{http.StatusServiceUnavailable, "overloaded_error", "timed out waiting for a free slot, retry later"}
+			return nil, busy("timed out waiting for a free slot, retry later")
 		}
 	}
 	s.inflight.Add(1)
@@ -466,12 +459,12 @@ func (s *Server) run(ctx context.Context, j *job) (<-chan Event, *apiErr) {
 		for i, t := range j.targets {
 			j.used = t.label
 			last := i == len(j.targets)-1
-			err := forward(ctx, t.backend.Run(ctx, t.model, t.prompt), out, t.emulated, !last)
+			err := forward(ctx, t.backend.Name(), t.backend.Run(ctx, t.model, t.prompt), out, t.emulated, !last)
 			if err == nil {
 				return
 			}
 			s.metrics.Inc("llm_gateway_fallbacks_total", "from", t.backend.Name())
-			slog.Warn("backend failed, trying the next target", "target", t.label, "err", err)
+			slog.Warn("backend failed, trying the next target", append([]any{"target", t.label}, logFailure(err)...)...)
 		}
 	}()
 	return out, nil
@@ -479,17 +472,23 @@ func (s *Server) run(ctx context.Context, j *job) (<-chan Event, *apiErr) {
 
 // forward copies a backend's events to out, reading them to the end. With
 // emulated functions the reply is a JSON object, turned here into text and
-// calls. If the backend fails before anything was sent and fallback is set,
-// the error is returned instead of sent, for the next target to be tried.
-func forward(ctx context.Context, in <-chan Event, out chan<- Event, emulated, fallback bool) error {
+// calls. An answer that ends without saying how is incomplete, and so is an
+// empty one that claims to be whole.
+//
+// If the backend fails before anything was sent and fallback is set, the
+// error is returned instead of sent, for the next target to be tried. Once
+// something was sent the answer belongs to this backend: its failure goes
+// to the client, never mixed with another backend's output.
+func forward(ctx context.Context, name string, in <-chan Event, out chan<- Event, emulated, fallback bool) error {
 	var (
 		sent   bool
 		failed error
+		finish string
 		buf    strings.Builder
 		usage  *Usage
 	)
 	for ev := range in {
-		if failed != nil {
+		if failed != nil || finish != "" && ev.Usage == nil {
 			continue // drain
 		}
 		switch {
@@ -497,11 +496,19 @@ func forward(ctx context.Context, in <-chan Event, out chan<- Event, emulated, f
 			failed = ev.Err
 		case ev.Usage != nil:
 			usage = ev.Usage
+		case ev.Finish != "":
+			finish = ev.Finish
 		case emulated && ev.Text != "":
 			buf.WriteString(ev.Text)
 		default:
 			sent = true
 			out <- ev
+		}
+	}
+	if failed == nil && finish == "" {
+		failed = newBackendError(name, failIncomplete, "the answer ended without a finish reason")
+		if ctx.Err() != nil {
+			failed = ctx.Err()
 		}
 	}
 	if failed == nil && emulated {
@@ -515,19 +522,21 @@ func forward(ctx context.Context, in <-chan Event, out chan<- Event, emulated, f
 			out <- Event{Call: &CallEvent{Index: i, ID: c.ID, Name: c.Function.Name, Args: c.Function.Arguments, Done: true}}
 		}
 	}
-	if failed == nil && !sent {
+	if failed == nil && !sent && finish == finishStop {
 		failed = errNoOutput
 	}
-	if failed != nil {
-		if fallback && !sent && ctx.Err() == nil {
-			return failed
-		}
-		out <- Event{Err: failed}
-		return nil
+	if failed != nil && fallback && !sent && ctx.Err() == nil && canFallback(failed) {
+		return failed
 	}
+	// The tokens were spent even when the answer is refused.
 	if usage != nil {
 		out <- Event{Usage: usage}
 	}
+	if failed != nil {
+		out <- Event{Err: failed}
+		return nil
+	}
+	out <- Event{Finish: finish}
 	return nil
 }
 
@@ -537,7 +546,17 @@ type answer struct {
 	calls    []ToolCall
 	usage    *Usage
 	searches []SearchEvent // in the order they started
+	finish   string
 	err      error
+}
+
+// reason is the finish reason of the reply: one that ended normally with
+// calls ended to have them run.
+func (a *answer) reason() string {
+	if a.finish == finishStop && len(a.calls) > 0 {
+		return finishToolCalls
+	}
+	return a.finish
 }
 
 func (a *answer) add(ev Event) {
@@ -546,6 +565,8 @@ func (a *answer) add(ev Event) {
 		a.err = ev.Err
 	case ev.Usage != nil:
 		a.usage = ev.Usage
+	case ev.Finish != "":
+		a.finish = ev.Finish
 	case ev.Call != nil:
 		c := ev.Call
 		for len(a.calls) <= c.Index {
@@ -609,14 +630,14 @@ func (s *Server) observe(j *job, a *answer) {
 	s.metrics.Inc("llm_gateway_requests_total", "endpoint", j.endpoint, "backend", backend, "status", status)
 	s.metrics.Observe("llm_gateway_request_duration_seconds", elapsed.Seconds(), "backend", backend)
 	attrs := []any{"endpoint", j.endpoint, "target", j.used, "status", status, "duration", elapsed.Round(time.Millisecond),
-		"calls", len(a.calls), "searches", len(a.searches)}
+		"calls", len(a.calls), "searches", len(a.searches), "finish", a.reason()}
 	if a.usage != nil {
 		s.metrics.Add("llm_gateway_tokens_total", float64(a.usage.PromptTokens), "backend", backend, "kind", "input")
 		s.metrics.Add("llm_gateway_tokens_total", float64(a.usage.CompletionTokens), "backend", backend, "kind", "output")
 		attrs = append(attrs, "input_tokens", a.usage.PromptTokens, "output_tokens", a.usage.CompletionTokens)
 	}
 	if a.err != nil {
-		slog.Error("completion failed", append(attrs, "err", a.err)...)
+		slog.Error("completion failed", append(attrs, logFailure(a.err)...)...)
 		return
 	}
 	slog.Info("completion done", attrs...)
@@ -628,7 +649,7 @@ func decodeBody(w http.ResponseWriter, r *http.Request, v any) *apiErr {
 	if err != nil {
 		var tooBig *http.MaxBytesError
 		if errors.As(err, &tooBig) {
-			return &apiErr{http.StatusRequestEntityTooLarge, "invalid_request_error", "the request body is too large"}
+			return &apiErr{status: http.StatusRequestEntityTooLarge, typ: "invalid_request_error", code: "request_too_large", msg: "the request body is too large"}
 		}
 		return badRequest("cannot read the request body")
 	}
@@ -658,8 +679,6 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 		writeAPIErr(w, aerr)
 		return
 	}
-	defer drain(events)
-
 	id := "chatcmpl-" + randomID()
 	created := time.Now().Unix()
 	var a answer
@@ -669,30 +688,86 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 	}()
 
 	if req.Stream {
-		s.streamChat(w, events, &a, id, created, req)
+		first, err := early(ctx, events, &a)
+		if err != nil {
+			writeAPIErr(w, publicError(err))
+			return
+		}
+		s.streamChat(w, replay(first, events), &a, id, created, req)
 		return
 	}
 	for ev := range events {
 		a.add(ev)
 	}
 	if a.err != nil {
-		writeBackendError(w, a.err)
+		writeAPIErr(w, publicError(a.err))
 		return
 	}
 	msg := ResponseMessage{Role: "assistant", ToolCalls: a.calls}
-	finish := "stop"
-	if len(a.calls) > 0 {
-		finish = "tool_calls"
-	}
 	if text := a.text.String(); text != "" || len(a.calls) == 0 {
 		msg.Content = &text
 		msg.Annotations = chatAnnotations(citations(text, searchSources(a.searches)))
 	}
 	writeJSON(w, http.StatusOK, ChatCompletionResponse{
 		ID: id, Object: "chat.completion", Created: created, Model: req.Model,
-		Choices: []Choice{{Message: msg, FinishReason: finish}},
+		Choices: []Choice{{Message: msg, FinishReason: a.reason()}},
 		Usage:   a.usage,
 	})
+}
+
+// streamGrace is how long a streaming request waits for its first event
+// before the event stream begins. A request that fails at once, as most
+// failures do, gets its status code and Retry-After as a plain response;
+// one that fails later can only say so inside the stream.
+var streamGrace = 5 * time.Second
+
+// early waits for the first event of a streaming job. It returns the error
+// of a job that failed before producing anything, recorded in a, or else
+// the events read so far, to be replayed in front of the others.
+func early(ctx context.Context, events <-chan Event, a *answer) ([]Event, error) {
+	timer := time.NewTimer(streamGrace)
+	defer timer.Stop()
+	var first []Event
+	for {
+		select {
+		case ev, ok := <-events:
+			if !ok {
+				return first, nil
+			}
+			first = append(first, ev)
+			switch {
+			case ev.Err != nil:
+				for _, ev := range first {
+					a.add(ev)
+				}
+				return nil, ev.Err
+			case ev.Usage != nil:
+				// The usage of a refused answer comes before its error:
+				// wait for what follows, within the same limits.
+				continue
+			}
+			return first, nil
+		case <-timer.C:
+			return first, nil
+		case <-ctx.Done():
+			return first, nil
+		}
+	}
+}
+
+func replay(first []Event, rest <-chan Event) iter.Seq[Event] {
+	return func(yield func(Event) bool) {
+		for _, ev := range first {
+			if !yield(ev) {
+				return
+			}
+		}
+		for ev := range rest {
+			if !yield(ev) {
+				return
+			}
+		}
+	}
 }
 
 type sseWriter struct {
@@ -737,7 +812,7 @@ func (s *sseWriter) done() {
 	s.flush()
 }
 
-func (s *Server) streamChat(w http.ResponseWriter, events <-chan Event, a *answer, id string, created int64, req ChatCompletionRequest) {
+func (s *Server) streamChat(w http.ResponseWriter, events iter.Seq[Event], a *answer, id string, created int64, req ChatCompletionRequest) {
 	sse := startSSE(w)
 	chunk := func(d Delta, finish *string) {
 		sse.send("", ChatCompletionChunk{
@@ -750,9 +825,9 @@ func (s *Server) streamChat(w http.ResponseWriter, events <-chan Event, a *answe
 		a.add(ev)
 		switch {
 		case ev.Err != nil:
-			slog.Error("backend error during stream", "err", ev.Err)
-			sse.send("", APIError{Error: APIErrorBody{Message: backendMessage(ev.Err), Type: "backend_error"}})
-			sse.done()
+			// The stream ends on the error, with no finish reason and no
+			// [DONE]: what was sent is not a complete answer.
+			sse.send("", APIError{Error: publicError(ev.Err).body()})
 			return
 		case ev.Text != "":
 			chunk(Delta{Content: ev.Text}, nil)
@@ -772,10 +847,7 @@ func (s *Server) streamChat(w http.ResponseWriter, events <-chan Event, a *answe
 	if anns := chatAnnotations(citations(a.text.String(), searchSources(a.searches))); len(anns) > 0 {
 		chunk(Delta{Annotations: anns}, nil)
 	}
-	finish := "stop"
-	if len(a.calls) > 0 {
-		finish = "tool_calls"
-	}
+	finish := a.reason()
 	chunk(Delta{}, &finish)
 	if req.StreamOptions != nil && req.StreamOptions.IncludeUsage && a.usage != nil {
 		sse.send("", ChatCompletionChunk{
@@ -788,33 +860,10 @@ func (s *Server) streamChat(w http.ResponseWriter, events <-chan Event, a *answe
 
 // ---- helpers ----
 
-func backendMessage(err error) string {
-	if errors.Is(err, context.DeadlineExceeded) {
-		return "backend timed out"
-	}
-	return err.Error()
-}
-
-func writeBackendError(w http.ResponseWriter, err error) {
-	if errors.Is(err, context.DeadlineExceeded) {
-		writeError(w, http.StatusGatewayTimeout, "timeout_error", "backend timed out")
-		return
-	}
-	writeError(w, http.StatusBadGateway, "backend_error", err.Error())
-}
-
 func writeJSON(w http.ResponseWriter, status int, v any) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
 	enc := json.NewEncoder(w)
 	enc.SetEscapeHTML(false)
 	enc.Encode(v)
-}
-
-func writeError(w http.ResponseWriter, status int, typ, msg string) {
-	writeJSON(w, status, APIError{Error: APIErrorBody{Message: msg, Type: typ}})
-}
-
-func writeAPIErr(w http.ResponseWriter, e *apiErr) {
-	writeError(w, e.status, e.typ, e.msg)
 }
