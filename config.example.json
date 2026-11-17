@@ -1,0 +1,35 @@
+{
+  "listen_addr": "127.0.0.1:8080",
+  "max_concurrency": 4,
+  "max_queue": 64,
+  "request_timeout": 300,
+  "warm": 2,
+  "warm_idle": 300,
+
+  "api_keys": [
+    { "name": "admin", "key_env": "GATEWAY_ADMIN_KEY" },
+    { "name": "team-a", "key_env": "GATEWAY_TEAM_A_KEY", "rpm": 60, "backends": ["claude"] }
+  ],
+
+  "models": {
+    "auto": ["claude/sonnet", "codex"],
+    "fast": ["claude/haiku", "ollama/llama3.3"]
+  },
+
+  "upstreams": [
+    {
+      "name": "ollama",
+      "base_url": "http://127.0.0.1:11434/v1",
+      "models": ["llama3.3"]
+    },
+    {
+      "name": "openai",
+      "base_url": "https://api.openai.com/v1",
+      "api_key_env": "OPENAI_API_KEY",
+      "models": ["gpt-5"]
+    }
+  ],
+
+  "response_ttl": 3600,
+  "response_max": 1000
+}
