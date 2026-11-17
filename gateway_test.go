@@ -612,3 +612,36 @@ func TestHealthAndMetrics(t *testing.T) {
 		}
 	}
 }
+
+func TestCodexIsolation(t *testing.T) {
+	ask := func(ts *httptest.Server) string {
+		status, body := post(t, ts, "/v1/chat/completions", "", obj{"model": "codex", "messages": user("ECHO")})
+		if status != 200 {
+			t.Fatalf("status %d: %s", status, body)
+		}
+		return *chatOf(t, body).Choices[0].Message.Content
+	}
+	srv, ts := newTestServer(t, nil)
+	home := srv.backends["codex"].(*CodexBackend).Home
+	got := ask(ts)
+	if home == "" || !strings.Contains(got, "home="+home+" ") {
+		t.Errorf("codex did not get the isolated home %q: %s", home, got)
+	}
+	for _, f := range []string{"shell_tool", "plugins", "computer_use", "multi_agent"} {
+		if !strings.Contains(got, "--disable "+f) {
+			t.Errorf("feature %s is not disabled: %s", f, got)
+		}
+	}
+	entries, _ := os.ReadDir(home)
+	for _, e := range entries {
+		if e.Name() != "auth.json" {
+			t.Errorf("unexpected %s in the isolated home", e.Name())
+		}
+	}
+
+	off := false
+	_, ts = newTestServer(t, func(c *Config) { c.CodexIsolate = &off })
+	if got := ask(ts); strings.Contains(got, "--disable") || strings.Contains(got, "llm-gateway-codex-") {
+		t.Errorf("isolation was not turned off: %s", got)
+	}
+}

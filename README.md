@@ -82,7 +82,7 @@ Every `/v1` endpoint is also served without the prefix.
 | Streaming | text deltas | whole messages | text deltas |
 | Function calling | native, over MCP | emulated with a JSON schema | passed through |
 | Images | data URLs and http(s) URLs | data URLs | passed through |
-| Web search | yes, with citations | yes | no |
+| Web search | yes, with citations | yes, with citations | no |
 | Structured output (`json_schema`) | yes | yes | passed through |
 | Reasoning effort | yes | yes | passed through |
 | Warm processes | yes | no | n/a |
@@ -106,10 +106,26 @@ the gateway starts another process with the same command line (model, system
 prompt, tools, schema) and keeps it idle for the next request of that kind.
 `warm` is the number of idle processes kept, `warm_idle` how long they wait.
 
-**Isolation.** The CLIs run in an empty directory, claude with no built-in
-tools (only web search when requested) and codex in a read-only sandbox.
-By default claude ignores the user's own settings, so that personal hooks,
-plugins and instructions do not leak into the answers (`claude_isolate`).
+**Isolation.** Both CLIs are agents that can act on the machine, and the
+prompt comes from the client: what they may do is cut down to answering.
+
+- claude runs in an empty directory with no built-in tools and no MCP
+  servers but the client's functions, and ignores the user's own settings,
+  so that personal hooks, plugins and instructions stay out of the answers
+  (`claude_isolate`). With web search it gets `WebSearch`, which runs on the
+  provider's side. `WebFetch` runs on this machine and can reach whatever
+  it can, internal addresses included: it is off unless `claude_web_fetch`
+  is set.
+- codex runs in a read-only sandbox, which alone still lets it read every
+  file the user can. So it also gets a home of its own, holding a link to
+  the credentials and nothing else (no configuration, MCP servers, plugins
+  or instructions), and the features that reach the machine (shell, plugins,
+  browser and computer use, sub-agents, ...) are disabled (`codex_isolate`).
+
+This is defence in depth on top of tools that were not built to face
+untrusted prompts, and it depends on the CLIs' own switches. To serve
+clients you do not trust, also run the gateway in a container or as a user
+with nothing worth reading.
 
 **Fallback.** A model alias lists several targets. If one fails before
 sending anything, the next is tried:
@@ -153,6 +169,8 @@ File-only settings (see [`config.example.json`](config.example.json)):
 | `models` | aliases: a name and the targets tried in order |
 | `upstreams` | OpenAI-compatible APIs: `name`, `base_url`, `api_key_env`, `models` |
 | `claude_isolate` | ignore the user's claude settings, default `true` |
+| `claude_web_fetch` | with web search, also let claude fetch URLs from this machine, default `false` |
+| `codex_isolate` | run codex with an empty home and its machine-reaching features disabled, default `true` |
 | `claude_extra_args`, `codex_extra_args` | arguments added to every command line |
 | `response_ttl`, `response_max` | how long and how many conversations are kept for `previous_response_id` |
 | `metrics_public` | serve `/metrics` without a key, default `true` |
@@ -163,6 +181,9 @@ The default address is the loopback interface. To serve other machines set
 `-addr :8080` **and** at least one API key: without a key, anyone who reaches
 the server uses your CLI accounts. Keys are accepted as
 `Authorization: Bearer <key>` or `x-api-key: <key>`.
+
+Turning `codex_isolate` off, or `claude_web_fetch` on, gives every client
+with a key a way to the machine's files or to its network: see *Isolation*.
 
 `/health`, `/metrics` and `/mcp/{id}` take no key. The MCP paths carry an
 unguessable id and only describe the functions of a request in progress.

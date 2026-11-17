@@ -5,23 +5,73 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"os"
 	"os/exec"
+	"path/filepath"
 )
 
 // CodexBackend answers with the codex CLI, one `codex exec` per request, in
 // a read-only sandbox. Codex reports whole messages, not text deltas.
+//
+// Codex is a coding agent: left as it is, it runs shell commands and uses
+// the MCP servers and plugins of the user's configuration, and its read-only
+// sandbox still lets it read every file the user can. A client could then
+// ask it for the machine's files. So, unless Home is empty, it runs with a
+// home of its own that holds the credentials and nothing else, and with the
+// features that reach the machine turned off.
 type CodexBackend struct {
 	Bin       string
 	WorkDir   string
 	ExtraArgs []string
+	Home      string // isolated CODEX_HOME; empty to use the user's own
 }
 
-func (c *CodexBackend) Name() string           { return "codex" }
-func (c *CodexBackend) NativeFunctions() bool  { return false }
-func (c *CodexBackend) Models() []string       { return nil }
-func (c *CodexBackend) Close()                 {}
-func (c *CodexBackend) Status() map[string]any { return map[string]any{"bin": c.Bin} }
+// codexDisabled are the codex features turned off in an isolated backend.
+var codexDisabled = []string{
+	"shell_tool", "apps", "plugins", "hooks", "browser_use", "browser_use_external",
+	"computer_use", "multi_agent", "image_generation", "memories",
+}
+
+// newCodexHome creates a CODEX_HOME with nothing but a link to the user's
+// credentials: no configuration, MCP servers, plugins or instructions.
+func newCodexHome() (string, error) {
+	src := os.Getenv("CODEX_HOME")
+	if src == "" {
+		home, err := os.UserHomeDir()
+		if err != nil {
+			return "", err
+		}
+		src = filepath.Join(home, ".codex")
+	}
+	dir, err := os.MkdirTemp("", "llm-gateway-codex-")
+	if err != nil {
+		return "", err
+	}
+	auth := filepath.Join(src, "auth.json")
+	if _, err := os.Stat(auth); err != nil {
+		slog.Warn("codex: no auth.json to share with the isolated home: codex needs its credentials in the environment", "path", auth)
+		return dir, nil
+	}
+	if err := os.Symlink(auth, filepath.Join(dir, "auth.json")); err != nil {
+		os.RemoveAll(dir)
+		return "", err
+	}
+	return dir, nil
+}
+
+func (c *CodexBackend) Name() string          { return "codex" }
+func (c *CodexBackend) NativeFunctions() bool { return false }
+func (c *CodexBackend) Models() []string      { return nil }
+func (c *CodexBackend) Status() map[string]any {
+	return map[string]any{"bin": c.Bin, "isolated": c.Home != ""}
+}
+
+func (c *CodexBackend) Close() {
+	if c.Home != "" {
+		os.RemoveAll(c.Home) // removes the link, not the credentials
+	}
+}
 
 func (c *CodexBackend) CheckImages(imgs []Image) error {
 	for _, img := range imgs {
@@ -65,6 +115,11 @@ func (c *CodexBackend) Run(ctx context.Context, model string, p Prompt) <-chan E
 		if p.WebSearch {
 			args = append(args, "-c", `web_search="live"`)
 		}
+		if c.Home != "" {
+			for _, f := range codexDisabled {
+				args = append(args, "--disable", f)
+			}
+		}
 		if len(p.Schema) > 0 {
 			f, err := os.CreateTemp("", "llm-gateway-schema-*.json")
 			if err == nil {
@@ -102,6 +157,9 @@ func (c *CodexBackend) Run(ctx context.Context, model string, p Prompt) <-chan E
 
 		cmd := exec.CommandContext(ctx, c.Bin, args...)
 		cmd.Dir = c.WorkDir
+		if c.Home != "" {
+			cmd.Env = append(os.Environ(), "CODEX_HOME="+c.Home)
+		}
 		answered, ended, lastErr := false, false, ""
 		runJSONL(ctx, cmd, text, out, func(line []byte) bool {
 			var l codexLine

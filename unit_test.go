@@ -336,16 +336,21 @@ func TestClaudeArgs(t *testing.T) {
 	joined := strings.Join(args, " ")
 	for _, want := range []string{
 		"-p --input-format stream-json --output-format stream-json --verbose --include-partial-messages",
-		"--tools WebSearch,WebFetch --strict-mcp-config",
+		"--tools WebSearch --strict-mcp-config",
 		"--system-prompt " + defaultSystemPrompt,
 		"--setting-sources project,local",
 		`--mcp-config {"mcpServers":{"fn":{"type":"http","url":"http://127.0.0.1:1/mcp/x"}}}`,
-		"--allowedTools WebSearch,WebFetch,mcp__fn__f,mcp__fn__g",
+		"--allowedTools WebSearch,mcp__fn__f,mcp__fn__g",
 		"--model opus --effort low --json-schema",
 	} {
 		if !strings.Contains(joined, want) {
 			t.Errorf("args lack %q:\n%s", want, joined)
 		}
+	}
+	// Fetching URLs from this machine is the operator's choice.
+	c.WebFetch = true
+	if got := strings.Join(c.args("", Prompt{WebSearch: true}, ""), " "); !strings.Contains(got, "--tools WebSearch,WebFetch ") || !strings.Contains(got, "--allowedTools WebSearch,WebFetch") {
+		t.Errorf("with web fetch: %s", got)
 	}
 	// No tools at all without web search: the value is an empty argument.
 	plain := c.args("", Prompt{}, "")

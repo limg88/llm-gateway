@@ -153,7 +153,7 @@ func fakeCodex(args []string) {
 	case strings.Contains(prompt, "FAIL_CODEX"):
 		say(map[string]any{"type": "turn.failed", "error": map[string]any{"message": "model overloaded"}})
 	case strings.Contains(prompt, "ECHO"):
-		message("codex prompt=" + prompt)
+		message("home=" + os.Getenv("CODEX_HOME") + " args=" + strings.Join(args, " ") + " prompt=" + prompt)
 	case schema && strings.Contains(prompt, "CALL_TOOL"):
 		message(`{"content":null,"tool_calls":[{"name":"get_weather","arguments":"{\"city\":\"Rome\"}"}]}`)
 	case schema:

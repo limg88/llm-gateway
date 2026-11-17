@@ -32,6 +32,7 @@ type ClaudeBackend struct {
 	Bin       string
 	WorkDir   string
 	Isolate   bool     // ignore the user's settings, hooks and plugins
+	WebFetch  bool     // with web search, also let the model fetch URLs
 	ExtraArgs []string // appended to every command line
 	// Publish serves the client's functions as an MCP server.
 	Publish func([]FunctionDefinition) (url string, unpublish func())
@@ -74,8 +75,14 @@ func (c *ClaudeBackend) args(model string, p Prompt, functionsURL string) []stri
 	tools := ""
 	var allowed []string
 	if p.WebSearch {
-		tools = "WebSearch,WebFetch"
-		allowed = append(allowed, "WebSearch", "WebFetch")
+		// WebSearch runs on the provider's servers. WebFetch runs here:
+		// it can reach whatever this machine can, internal addresses
+		// included, so it is the operator's choice.
+		allowed = append(allowed, "WebSearch")
+		if c.WebFetch {
+			allowed = append(allowed, "WebFetch")
+		}
+		tools = strings.Join(allowed, ",")
 	}
 	args := []string{
 		"-p",

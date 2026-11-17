@@ -47,6 +47,8 @@ type Config struct {
 	Models          map[string][]string `json:"models"`   // alias -> targets, tried in order
 	Upstreams       []UpstreamConfig    `json:"upstreams"`
 	ClaudeIsolate   *bool               `json:"claude_isolate"`
+	ClaudeWebFetch  bool                `json:"claude_web_fetch"` // with web search, let claude fetch URLs from this machine
+	CodexIsolate    *bool               `json:"codex_isolate"`
 	ClaudeExtraArgs []string            `json:"claude_extra_args"`
 	CodexExtraArgs  []string            `json:"codex_extra_args"`
 	ResponseTTL     int                 `json:"response_ttl"` // seconds a response can be continued

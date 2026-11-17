@@ -57,6 +57,7 @@ func NewServer(cfg Config) *Server {
 			c := NewClaudeBackend(cfg.ClaudeBin, cfg.WorkDir, cfg.Warm, time.Duration(cfg.WarmIdle)*time.Second)
 			c.Publish = s.PublishFunctions
 			c.ExtraArgs = cfg.ClaudeExtraArgs
+			c.WebFetch = cfg.ClaudeWebFetch
 			if cfg.ClaudeIsolate != nil {
 				c.Isolate = *cfg.ClaudeIsolate
 			}
@@ -66,7 +67,19 @@ func NewServer(cfg Config) *Server {
 				return float64(idle)
 			})
 		case "codex":
-			s.backends[name] = &CodexBackend{Bin: cfg.CodexBin, WorkDir: cfg.WorkDir, ExtraArgs: cfg.CodexExtraArgs}
+			c := &CodexBackend{Bin: cfg.CodexBin, WorkDir: cfg.WorkDir, ExtraArgs: cfg.CodexExtraArgs}
+			if cfg.CodexIsolate == nil || *cfg.CodexIsolate {
+				home, err := newCodexHome()
+				if err != nil {
+					// Never fall back to the unprotected mode silently.
+					slog.Error("codex: cannot create the isolated home, the backend is disabled", "err", err)
+					continue
+				}
+				c.Home = home
+			} else {
+				slog.Warn("codex runs with the user's own configuration: clients can make it read files and use its tools")
+			}
+			s.backends[name] = c
 		}
 	}
 	for _, u := range cfg.Upstreams {
