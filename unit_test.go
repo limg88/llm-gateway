@@ -401,6 +401,8 @@ func TestConfig(t *testing.T) {
 		"empty alias":      `{"models": {"x": []}}`,
 		"unknown backend":  `{"backends": ["gemini"]}`,
 		"zero concurrency": `{"max_concurrency": 0}`,
+		"unsafe codex arg": `{"codex_extra_args": ["--sandbox=danger-full-access"]}`,
+		"codex bypass":     `{"codex_extra_args": ["--dangerously-bypass-approvals-and-sandbox"]}`,
 	} {
 		os.WriteFile(path, []byte(body), 0o600)
 		t.Setenv("MAX_CONCURRENCY", "")

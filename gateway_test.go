@@ -627,10 +627,19 @@ func TestCodexIsolation(t *testing.T) {
 	if home == "" || !strings.Contains(got, "home="+home+" ") {
 		t.Errorf("codex did not get the isolated home %q: %s", home, got)
 	}
-	for _, f := range []string{"shell_tool", "plugins", "computer_use", "multi_agent"} {
+	// Whatever the installed codex has enabled is disabled, known or not.
+	for _, f := range []string{"shell_tool", "code_mode_host", "new_agent_thing"} {
 		if !strings.Contains(got, "--disable "+f) {
 			t.Errorf("feature %s is not disabled: %s", f, got)
 		}
+	}
+	if strings.Contains(got, "--disable quiet_feature") {
+		t.Errorf("a feature that is off was disabled: %s", got)
+	}
+	// Web search needs the code-mode host, and nothing else.
+	status, body := post(t, ts, "/v1/chat/completions", "", obj{"model": "codex", "messages": user("ECHO"), "web_search_options": obj{}})
+	if got := string(body); status != 200 || strings.Contains(got, "--disable code_mode_host") || !strings.Contains(got, "--disable shell_tool") {
+		t.Errorf("web search: %d %s", status, got)
 	}
 	entries, _ := os.ReadDir(home)
 	for _, e := range entries {

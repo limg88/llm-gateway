@@ -119,8 +119,12 @@ prompt comes from the client: what they may do is cut down to answering.
 - codex runs in a read-only sandbox, which alone still lets it read every
   file the user can. So it also gets a home of its own, holding a link to
   the credentials and nothing else (no configuration, MCP servers, plugins
-  or instructions), and the features that reach the machine (shell, plugins,
-  browser and computer use, sub-agents, ...) are disabled (`codex_isolate`).
+  or instructions), and every feature the installed codex reports as
+  enabled is turned off: shell, file and image tools, plugins, browser and
+  computer use, sub-agents, and whatever a later version adds. Web search
+  keeps the one feature it needs. If the features cannot be listed the
+  request fails rather than run unprotected, and `codex_extra_args` that
+  would widen the sandbox are refused (`codex_isolate`).
 
 This is defence in depth on top of tools that were not built to face
 untrusted prompts, and it depends on the CLIs' own switches. To serve
@@ -170,7 +174,7 @@ File-only settings (see [`config.example.json`](config.example.json)):
 | `upstreams` | OpenAI-compatible APIs: `name`, `base_url`, `api_key_env`, `models` |
 | `claude_isolate` | ignore the user's claude settings, default `true` |
 | `claude_web_fetch` | with web search, also let claude fetch URLs from this machine, default `false` |
-| `codex_isolate` | run codex with an empty home and its machine-reaching features disabled, default `true` |
+| `codex_isolate` | run codex with an empty home and every enabled feature turned off, default `true` |
 | `claude_extra_args`, `codex_extra_args` | arguments added to every command line |
 | `response_ttl`, `response_max` | how long and how many conversations are kept for `previous_response_id` |
 | `metrics_public` | serve `/metrics` without a key, default `true` |

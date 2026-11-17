@@ -9,6 +9,8 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
+	"sync"
 )
 
 // CodexBackend answers with the codex CLI, one `codex exec` per request, in
@@ -19,18 +21,71 @@ import (
 // sandbox still lets it read every file the user can. A client could then
 // ask it for the machine's files. So, unless Home is empty, it runs with a
 // home of its own that holds the credentials and nothing else, and with the
-// features that reach the machine turned off.
+// every feature the installed codex has on turned off.
 type CodexBackend struct {
 	Bin       string
 	WorkDir   string
 	ExtraArgs []string
 	Home      string // isolated CODEX_HOME; empty to use the user's own
+
+	mu       sync.Mutex
+	features []string // enabled features of the installed codex
 }
 
-// codexDisabled are the codex features turned off in an isolated backend.
-var codexDisabled = []string{
-	"shell_tool", "apps", "plugins", "hooks", "browser_use", "browser_use_external",
-	"computer_use", "multi_agent", "image_generation", "memories",
+// codexKeep are the features an isolated codex may keep, and when. Every
+// other feature the installed codex reports as enabled is turned off, so
+// that a feature added by a later version starts disabled here.
+//
+// code_mode_host carries the web search tool. With it codex also sees
+// apply_patch, which the read-only sandbox refuses.
+func codexKeep(feature string, p Prompt) bool {
+	return feature == "code_mode_host" && p.WebSearch
+}
+
+// enabledFeatures asks the installed codex which features are on, in the
+// isolated home. The answer is cached; a failure is not, and fails the
+// request: codex never runs isolated without this list.
+func (c *CodexBackend) enabledFeatures(ctx context.Context) ([]string, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.features != nil {
+		return c.features, nil
+	}
+	cmd := exec.CommandContext(ctx, c.Bin, "features", "list")
+	cmd.Env = append(os.Environ(), "CODEX_HOME="+c.Home)
+	cmd.Dir = c.WorkDir
+	out, err := cmd.Output()
+	if err != nil {
+		return nil, fmt.Errorf("codex: cannot list the features to disable: %w", err)
+	}
+	features := []string{}
+	for _, line := range strings.Split(string(out), "\n") {
+		// name, stage (one or more words), enabled
+		f := strings.Fields(line)
+		if len(f) >= 3 && f[len(f)-1] == "true" {
+			features = append(features, f[0])
+		}
+	}
+	if len(features) == 0 {
+		return nil, errors.New("codex: unexpected output of `codex features list`")
+	}
+	c.features = features
+	return features, nil
+}
+
+// codexUnsafeArgs are the options that would undo the isolation.
+var codexUnsafeArgs = []string{"--enable", "--sandbox", "-s", "--add-dir", "--config", "-c", "--profile", "-p", "--approve-for-me", "--cd", "-C"}
+
+// checkCodexArgs refuses, for an isolated codex, the extra arguments that
+// widen what it can reach.
+func checkCodexArgs(args []string) error {
+	for _, a := range args {
+		name, _, _ := strings.Cut(a, "=")
+		if strings.HasPrefix(name, "--dangerously") || oneOf(name, codexUnsafeArgs) {
+			return fmt.Errorf("codex_extra_args: %s is not allowed with codex_isolate", name)
+		}
+	}
+	return nil
 }
 
 // newCodexHome creates a CODEX_HOME with nothing but a link to the user's
@@ -85,10 +140,15 @@ func (c *CodexBackend) CheckImages(imgs []Image) error {
 type codexLine struct {
 	Type string `json:"type"`
 	Item *struct {
-		ID    string `json:"id"`
-		Type  string `json:"type"`
-		Text  string `json:"text"`
-		Query string `json:"query"`
+		ID     string `json:"id"`
+		Type   string `json:"type"`
+		Text   string `json:"text"`
+		Query  string `json:"query"`
+		Action *struct {
+			Type  string `json:"type"`
+			Query string `json:"query"`
+			URL   string `json:"url"`
+		} `json:"action"`
 	} `json:"item"`
 	Usage *struct {
 		InputTokens     int `json:"input_tokens"`
@@ -116,8 +176,15 @@ func (c *CodexBackend) Run(ctx context.Context, model string, p Prompt) <-chan E
 			args = append(args, "-c", `web_search="live"`)
 		}
 		if c.Home != "" {
-			for _, f := range codexDisabled {
-				args = append(args, "--disable", f)
+			features, err := c.enabledFeatures(ctx)
+			if err != nil {
+				out <- Event{Err: err}
+				return
+			}
+			for _, f := range features {
+				if !codexKeep(f, p) {
+					args = append(args, "--disable", f)
+				}
 			}
 		}
 		if len(p.Schema) > 0 {
@@ -181,11 +248,11 @@ func (c *CodexBackend) Run(ctx context.Context, model string, p Prompt) <-chan E
 						emit(ctx, out, Event{Text: l.Item.Text})
 					}
 				case "web_search":
-					emit(ctx, out, Event{Search: &SearchEvent{
-						ID:     l.Item.ID,
-						Done:   l.Type == "item.completed",
-						Action: &WebSearchAction{Type: "search", Query: l.Item.Query},
-					}})
+					action := &WebSearchAction{Type: "search", Query: l.Item.Query}
+					if a := l.Item.Action; a != nil && a.Type == "open_page" {
+						action = &WebSearchAction{Type: "open_page", URL: a.URL}
+					}
+					emit(ctx, out, Event{Search: &SearchEvent{ID: l.Item.ID, Done: l.Type == "item.completed", Action: action}})
 				}
 			case "turn.completed":
 				if u := l.Usage; u != nil {

@@ -206,6 +206,11 @@ func (c *Config) validate() error {
 			return fmt.Errorf("unknown backend %q in backends: use claude or codex", b)
 		}
 	}
+	if c.CodexIsolate == nil || *c.CodexIsolate {
+		if err := checkCodexArgs(c.CodexExtraArgs); err != nil {
+			return err
+		}
+	}
 	for alias, targets := range c.Models {
 		if !nameRE.MatchString(alias) || len(targets) == 0 {
 			return fmt.Errorf("invalid model alias %q", alias)

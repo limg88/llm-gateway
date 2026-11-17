@@ -25,6 +25,11 @@ func TestMain(m *testing.M) {
 			fakeClaude(os.Args[1:])
 		case "exec":
 			fakeCodex(os.Args[1:])
+		case "features":
+			fmt.Print("shell_tool       stable             true\n" +
+				"code_mode_host   stable             true\n" +
+				"new_agent_thing  under development  true\n" +
+				"quiet_feature    under development  false\n")
 		}
 		os.Exit(0)
 	}
