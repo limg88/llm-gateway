@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"crypto/subtle"
 	"encoding/json"
 	"errors"
@@ -11,8 +12,10 @@ import (
 	"iter"
 	"log/slog"
 	"net/http"
+	"os"
 	"os/exec"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 )
@@ -21,25 +24,32 @@ const maxBody = 64 << 20
 
 // Server is the HTTP API in front of the backends.
 type Server struct {
-	cfg      Config
-	backends map[string]Backend
-	keys     []*apiKey
-	sem      chan struct{} // one token per running backend request
-	queued   atomic.Int64
-	inflight atomic.Int64
-	mcp      *mcpRegistry
-	store    *conversationStore
-	metrics  *Metrics
-	started  time.Time
+	ledgerLock   *os.File
+	cache        responseCache
+	budgetDay    string
+	spent        map[string]float64
+	ledgerFailed bool
+	ledgerMu     sync.Mutex
+	cfg          Config
+	backends     map[string]Backend
+	keys         []*apiKey
+	sem          chan struct{} // one token per running backend request
+	queued       atomic.Int64
+	inflight     atomic.Int64
+	mcp          *mcpRegistry
+	store        *conversationStore
+	metrics      *Metrics
+	started      time.Time
 }
 
 type apiKey struct {
+	digest [32]byte
 	KeyConfig
 	limiter *rateLimiter
 	allowed map[string]bool // nil for every backend
 }
 
-var anonymous = &apiKey{KeyConfig: KeyConfig{Name: "anonymous"}}
+var anonymous = &apiKey{KeyConfig: KeyConfig{Name: "anonymous", Project: "personal"}}
 
 func NewServer(cfg Config) *Server {
 	s := &Server{
@@ -86,7 +96,8 @@ func NewServer(cfg Config) *Server {
 		s.backends[u.Name] = NewUpstreamBackend(u)
 	}
 	for _, k := range cfg.APIKeys {
-		key := &apiKey{KeyConfig: k}
+		key := &apiKey{KeyConfig: k, digest: sha256.Sum256([]byte(k.Key))}
+		key.Key = ""
 		if k.RPM > 0 {
 			key.limiter = newRateLimiter(k.RPM)
 		}
@@ -110,6 +121,9 @@ func NewServer(cfg Config) *Server {
 }
 
 func (s *Server) Close() {
+	if s.ledgerLock != nil {
+		defer s.ledgerLock.Close()
+	}
 	for _, b := range s.backends {
 		b.Close()
 	}
@@ -134,10 +148,14 @@ func (s *Server) Handler() http.Handler {
 	}
 	mux.HandleFunc("POST /mcp/{id}", s.handleMCP)
 	for _, prefix := range []string{"", "/v1"} {
+		mux.Handle("POST "+prefix+"/embeddings", s.auth(s.native("embeddings", nil)))
+		if s.cfg.Ledger != "" {
+			mux.Handle("GET "+prefix+"/usage", s.auth(http.HandlerFunc(s.handleUsage)))
+		}
 		mux.Handle("GET "+prefix+"/models", s.auth(http.HandlerFunc(s.handleModels)))
-		mux.Handle("POST "+prefix+"/chat/completions", s.auth(http.HandlerFunc(s.handleChatCompletions)))
-		mux.Handle("POST "+prefix+"/responses", s.auth(http.HandlerFunc(s.handleResponses)))
-		mux.Handle("POST "+prefix+"/messages", s.auth(http.HandlerFunc(s.handleMessages)))
+		mux.Handle("POST "+prefix+"/chat/completions", s.auth(s.native("chat/completions", s.handleChatCompletions)))
+		mux.Handle("POST "+prefix+"/responses", s.auth(s.native("responses", s.handleResponses)))
+		mux.Handle("POST "+prefix+"/messages", s.auth(s.native("messages", s.handleMessages)))
 	}
 	return logRequests(mux)
 }
@@ -155,6 +173,10 @@ func keyOf(r *http.Request) *apiKey {
 // and applies its rate limit. Without configured keys everyone is let in.
 func (s *Server) auth(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		writeError := writeAPIErr
+		if strings.HasSuffix(r.URL.Path, "/messages") {
+			writeError = writeAnthropicAPIErr
+		}
 		key := anonymous
 		if len(s.keys) > 0 {
 			given := r.Header.Get("x-api-key")
@@ -162,22 +184,23 @@ func (s *Server) auth(next http.Handler) http.Handler {
 				given = strings.TrimPrefix(h, "Bearer ")
 			}
 			key = nil
+			digest := sha256.Sum256([]byte(given))
 			for _, k := range s.keys {
 				// Every key is compared, in constant time.
-				if subtle.ConstantTimeCompare([]byte(given), []byte(k.Key)) == 1 {
+				if subtle.ConstantTimeCompare(digest[:], k.digest[:]) == 1 {
 					key = k
 				}
 			}
 			if key == nil {
 				s.metrics.Inc("llm_gateway_rejected_total", "reason", "unauthorized")
-				writeAPIErr(w, &apiErr{status: http.StatusUnauthorized, typ: "authentication_error", code: "authentication_error", msg: "invalid API key"})
+				writeError(w, &apiErr{status: http.StatusUnauthorized, typ: "authentication_error", code: "authentication_error", msg: "invalid API key"})
 				return
 			}
 		}
 		if key.limiter != nil {
 			if ok, wait := key.limiter.allow(); !ok {
 				s.metrics.Inc("llm_gateway_rejected_total", "reason", "rate_limited")
-				writeAPIErr(w, &apiErr{status: http.StatusTooManyRequests, typ: "rate_limit_error", code: "gateway_rate_limit",
+				writeError(w, &apiErr{status: http.StatusTooManyRequests, typ: "rate_limit_error", code: "gateway_rate_limit",
 					msg: fmt.Sprintf("rate limit of %d requests per minute exceeded", key.RPM), retryAfter: wait})
 				return
 			}
@@ -217,7 +240,7 @@ func logRequests(next http.Handler) http.Handler {
 		sw := &statusWriter{ResponseWriter: w}
 		defer func() {
 			if v := recover(); v != nil {
-				slog.Error("panic", "path", r.URL.Path, "err", v)
+				slog.Error("request panic")
 				if sw.status == 0 {
 					writeAPIErr(sw, &apiErr{status: http.StatusInternalServerError, typ: "server_error", code: "internal_error", msg: "internal error"})
 				}
@@ -226,7 +249,7 @@ func logRequests(next http.Handler) http.Handler {
 			if r.URL.Path == "/health" || r.URL.Path == "/metrics" || strings.HasPrefix(r.URL.Path, "/mcp/") {
 				level = slog.LevelDebug
 			}
-			slog.Log(r.Context(), level, "request", "method", r.Method, "path", r.URL.Path, "status", sw.status,
+			slog.Log(r.Context(), level, "request", "method", r.Method, "route", r.Pattern, "status", sw.status,
 				"duration", time.Since(start).Round(time.Millisecond))
 		}()
 		next.ServeHTTP(sw, r)
@@ -249,6 +272,9 @@ func (s *Server) resolveModel(name string, key *apiKey) ([]target, *apiErr) {
 	if alias, ok := s.cfg.Models[name]; ok {
 		names = alias
 	}
+	if routes, ok := key.Routes[name]; ok {
+		names = routes
+	}
 	var targets []target
 	denied := false
 	for _, n := range names {
@@ -262,7 +288,7 @@ func (s *Server) resolveModel(name string, key *apiKey) ([]target, *apiErr) {
 			slog.Warn("model alias names an unknown backend", "alias", name, "target", n)
 			continue
 		}
-		if key.allowed != nil && !key.allowed[backendName] {
+		if !key.permits(b) {
 			denied = true
 			continue
 		}
@@ -289,7 +315,7 @@ func (s *Server) handleModels(w http.ResponseWriter, r *http.Request) {
 	created := s.started.Unix()
 	list := ModelList{Object: "list", Data: []Model{}}
 	for _, name := range s.backendNames() {
-		if key.allowed != nil && !key.allowed[name] {
+		if !key.permits(s.backends[name]) {
 			continue
 		}
 		owner := name
@@ -307,10 +333,20 @@ func (s *Server) handleModels(w http.ResponseWriter, r *http.Request) {
 			list.Data = append(list.Data, Model{ID: name + "/" + m, Object: "model", Created: created, OwnedBy: owner})
 		}
 	}
-	for _, alias := range sortedKeys(s.cfg.Models) {
+	aliases := map[string]bool{}
+	for a := range s.cfg.Models {
+		aliases[a] = true
+	}
+	for a := range key.Routes {
+		aliases[a] = true
+	}
+	for _, alias := range sortedKeys(aliases) {
 		if _, err := s.resolveModel(alias, key); err == nil {
 			list.Data = append(list.Data, Model{ID: alias, Object: "model", Created: created, OwnedBy: "llm-gateway"})
 		}
+	}
+	for i, m := range list.Data {
+		list.Data[i].Discovery = s.cfg.Discovery[m.ID]
 	}
 	writeJSON(w, http.StatusOK, list)
 }
@@ -348,6 +384,7 @@ type prepared struct {
 
 // job is a request ready to run.
 type job struct {
+	project  string
 	endpoint string
 	model    string // as the client named it
 	stream   bool
@@ -381,7 +418,7 @@ func (s *Server) prepare(endpoint string, req ChatCompletionRequest, key *apiKey
 	if ws := bytes.TrimSpace(req.WebSearchOptions); len(ws) > 0 && !bytes.Equal(ws, []byte("null")) {
 		base.WebSearch = true
 	}
-	j := &job{endpoint: endpoint, model: req.Model, stream: req.Stream, start: time.Now()}
+	j := &job{project: key.Project, endpoint: endpoint, model: req.Model, stream: req.Stream, start: time.Now()}
 	for i, t := range targets {
 		p := base
 		emulated, err := applyTools(&p, req, t.backend.NativeFunctions())
@@ -398,14 +435,14 @@ func (s *Server) prepare(endpoint string, req ChatCompletionRequest, key *apiKey
 			if i == 0 {
 				return nil, badRequest("%s", err)
 			}
-			slog.Warn("fallback target left out", "target", t.label, "err", err)
+			slog.Warn("fallback target incompatible")
 			continue
 		}
 		j.targets = append(j.targets, prepared{target: t, prompt: p, emulated: emulated})
 	}
-	slog.Info("completion", "endpoint", endpoint, "key", key.Name, "model", req.Model, "targets", len(j.targets),
+	slog.Info("completion", "endpoint", endpoint, "key", key.Name, "targets", len(j.targets),
 		"stream", req.Stream, "functions", len(req.Tools), "emulated", j.targets[0].emulated,
-		"web_search", base.WebSearch, "effort", req.ReasoningEffort, "images", len(base.Images), "max_tokens", base.MaxTokens)
+		"web_search", base.WebSearch, "images", len(base.Images), "max_tokens", base.MaxTokens)
 	return j, nil
 }
 
@@ -431,35 +468,33 @@ func applyFormat(p *Prompt, f *ResponseFormat) error {
 // run waits for a free slot and starts the job. The events must be read to
 // the end: the slot is released when they are.
 func (s *Server) run(ctx context.Context, j *job) (<-chan Event, *apiErr) {
-	select {
-	case s.sem <- struct{}{}:
-	default:
-		if int(s.queued.Load()) >= s.cfg.MaxQueue {
-			s.metrics.Inc("llm_gateway_rejected_total", "reason", "queue_full")
-			return nil, busy("the server is at capacity, retry later")
-		}
-		s.queued.Add(1)
-		select {
-		case s.sem <- struct{}{}:
-			s.queued.Add(-1)
-		case <-ctx.Done():
-			s.queued.Add(-1)
-			s.metrics.Inc("llm_gateway_rejected_total", "reason", "queue_timeout")
-			return nil, busy("timed out waiting for a free slot, retry later")
-		}
+	if err := s.acquire(ctx); err != nil {
+		return nil, err
 	}
-	s.inflight.Add(1)
 	out := make(chan Event, 16)
 	go func() {
 		defer close(out)
-		defer func() {
-			s.inflight.Add(-1)
-			<-s.sem
-		}()
+		defer s.release()
+		id := requestID()
 		for i, t := range j.targets {
 			j.used = t.label
 			last := i == len(j.targets)-1
-			err := forward(ctx, t.backend.Name(), t.backend.Run(ctx, t.model, t.prompt), out, t.emulated, !last)
+			entry := auditEntry{Project: j.project, Request: id, Target: t.label, Attempt: i + 1, Outcome: "started"}
+			if err := s.audit(entry); err != nil {
+				out <- Event{Err: errors.New("accounting unavailable")}
+				return
+			}
+			meter := func(u *Usage, failed error) error {
+				entry.Outcome = "completed"
+				if failed != nil {
+					entry.Outcome = "failed"
+				}
+				if u != nil {
+					entry.Units = &Units{Input: int64(u.PromptTokens), Output: int64(u.CompletionTokens)}
+				}
+				return s.audit(entry)
+			}
+			err := forward(ctx, t.backend.Name(), t.backend.Run(ctx, t.model, t.prompt), out, t.emulated, !last, meter)
 			if err == nil {
 				return
 			}
@@ -479,7 +514,7 @@ func (s *Server) run(ctx context.Context, j *job) (<-chan Event, *apiErr) {
 // error is returned instead of sent, for the next target to be tried. Once
 // something was sent the answer belongs to this backend: its failure goes
 // to the client, never mixed with another backend's output.
-func forward(ctx context.Context, name string, in <-chan Event, out chan<- Event, emulated, fallback bool) error {
+func forward(ctx context.Context, name string, in <-chan Event, out chan<- Event, emulated, fallback bool, meter func(*Usage, error) error) error {
 	var (
 		sent   bool
 		failed error
@@ -524,6 +559,10 @@ func forward(ctx context.Context, name string, in <-chan Event, out chan<- Event
 	}
 	if failed == nil && !sent && finish == finishStop {
 		failed = errNoOutput
+	}
+	if err := meter(usage, failed); err != nil {
+		out <- Event{Err: errors.New("accounting unavailable")}
+		return nil
 	}
 	if failed != nil && fallback && !sent && ctx.Err() == nil && canFallback(failed) {
 		return failed
@@ -866,4 +905,39 @@ func writeJSON(w http.ResponseWriter, status int, v any) {
 	enc := json.NewEncoder(w)
 	enc.SetEscapeHTML(false)
 	enc.Encode(v)
+}
+
+func (s *Server) acquire(ctx context.Context) *apiErr {
+	select {
+	case s.sem <- struct{}{}:
+	default:
+		if int(s.queued.Add(1)) > s.cfg.MaxQueue {
+			s.queued.Add(-1)
+			s.metrics.Inc("llm_gateway_rejected_total", "reason", "queue_full")
+			return busy("the server is at capacity, retry later")
+		}
+		select {
+		case s.sem <- struct{}{}:
+			s.queued.Add(-1)
+		case <-ctx.Done():
+			s.queued.Add(-1)
+			s.metrics.Inc("llm_gateway_rejected_total", "reason", "queue_timeout")
+			return busy("timed out waiting for a free slot, retry later")
+		}
+	}
+	s.inflight.Add(1)
+
+	return nil
+}
+func (s *Server) release() { s.inflight.Add(-1); <-s.sem }
+
+func (k *apiKey) permits(b Backend) bool {
+	if k.allowed != nil && !k.allowed[b.Name()] {
+		return false
+	}
+	if k.DataClass == "" {
+		return true
+	}
+	up, ok := b.(*UpstreamBackend)
+	return ok && classLevel(up.cfg.MaxDataClass) >= classLevel(k.DataClass)
 }

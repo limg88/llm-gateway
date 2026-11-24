@@ -25,7 +25,7 @@ func newTestServer(t *testing.T, edit func(*Config)) (*Server, *httptest.Server)
 	if edit != nil {
 		edit(&cfg)
 	}
-	ts := httptest.NewUnstartedServer(nil)
+	ts := testListener(nil)
 	cfg.ListenAddr = ts.Listener.Addr().String()
 	cfg.SelfURL = "http://" + cfg.ListenAddr
 	if err := cfg.validate(); err != nil {
@@ -245,7 +245,7 @@ func TestFallback(t *testing.T) {
 	srv, ts := newTestServer(t, func(c *Config) {
 		c.Models = map[string][]string{"auto": {"claude/haiku", "codex"}}
 	})
-	status, body := post(t, ts, "/v1/chat/completions", "", obj{"model": "auto", "messages": user("FAIL_CLAUDE")})
+	status, body := post(t, ts, "/v1/chat/completions", "", obj{"model": "auto", "messages": user("BUSY_CLAUDE")})
 	if status != 200 {
 		t.Fatalf("status %d: %s", status, body)
 	}
@@ -549,7 +549,7 @@ func TestQueueFullAndTimeout(t *testing.T) {
 
 func TestUpstream(t *testing.T) {
 	var got obj
-	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	upstream := testHTTP(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Header.Get("Authorization") != "Bearer up-key" {
 			http.Error(w, `{"error":{"message":"bad key"}}`, 401)
 			return

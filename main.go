@@ -38,7 +38,7 @@ func main() {
 		fmt.Fprintln(os.Stderr, "llm-gateway: invalid log level:", cfg.LogLevel)
 		os.Exit(2)
 	}
-	slog.SetDefault(slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: level})))
+	slog.SetDefault(slog.New(slog.NewJSONHandler(os.Stderr, &slog.HandlerOptions{Level: level})))
 
 	if cfg.Detach && os.Getenv(detachedEnv) == "" {
 		_, port, _ := net.SplitHostPort(cfg.ListenAddr)
@@ -62,21 +62,26 @@ func main() {
 	srv := NewServer(cfg)
 	defer srv.Close()
 
-	if len(cfg.APIKeys) == 0 && !cfg.loopback() {
-		slog.Warn("no API key is set and the server is reachable from other machines: anyone who reaches it can use your CLI accounts")
+	if cfg.Ledger != "" {
+		if err := srv.checkLedger(); err != nil {
+			slog.Error("cannot open usage ledger")
+			os.Exit(1)
+		}
 	}
-
 	httpSrv := &http.Server{
 		Addr:              cfg.ListenAddr,
 		Handler:           srv.Handler(),
 		ReadHeaderTimeout: 10 * time.Second,
+		WriteTimeout:      time.Duration(cfg.RequestTimeout+1) * time.Second,
+		IdleTimeout:       60 * time.Second,
+		ReadTimeout:       time.Duration(cfg.RequestTimeout) * time.Second,
 	}
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 	go func() {
 		<-ctx.Done()
 		slog.Info("shutting down")
-		shutdown, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		shutdown, cancel := context.WithTimeout(context.Background(), time.Duration(cfg.RequestTimeout+1)*time.Second)
 		defer cancel()
 		if err := httpSrv.Shutdown(shutdown); err != nil {
 			httpSrv.Close()

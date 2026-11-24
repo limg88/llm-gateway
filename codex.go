@@ -74,7 +74,7 @@ func (c *CodexBackend) enabledFeatures(ctx context.Context) ([]string, error) {
 		return c.features, nil
 	}
 	cmd := exec.CommandContext(ctx, c.Bin, "features", "list")
-	cmd.Env = append(os.Environ(), "CODEX_HOME="+c.Home)
+	cmd.Env = append(childEnvironment(), "CODEX_HOME="+c.Home)
 	cmd.Dir = c.WorkDir
 	out, err := cmd.Output()
 	if err != nil {
@@ -245,9 +245,10 @@ func (c *CodexBackend) Run(ctx context.Context, model string, p Prompt) <-chan E
 		}
 
 		cmd := exec.CommandContext(ctx, c.Bin, args...)
+		cmd.Env = childEnvironment()
 		cmd.Dir = c.WorkDir
 		if c.Home != "" {
-			cmd.Env = append(os.Environ(), "CODEX_HOME="+c.Home)
+			cmd.Env = append(childEnvironment(), "CODEX_HOME="+c.Home)
 		}
 		var (
 			answered, ended bool

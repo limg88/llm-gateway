@@ -3,3 +3,8 @@
 *.log
 config.json
 .DS_Store
+.env
+.env.*
+gateway.toml
+usage.jsonl
+usage.jsonl.lock

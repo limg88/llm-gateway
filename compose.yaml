@@ -1,0 +1,19 @@
+services:
+  gateway:
+    build: .
+    environment:
+      GATEWAY_PROJECT_KEY: ${GATEWAY_PROJECT_KEY:?set the gateway project key}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+    ports:
+      - "127.0.0.1:8080:8080"
+    volumes:
+      - ${GATEWAY_CONFIG:-./gateway.example.toml}:/etc/llm-gateway.toml:ro
+      - usage:/data
+    read_only: true
+    tmpfs:
+      - /tmp
+    cap_drop:
+      - ALL
+volumes:
+  usage:

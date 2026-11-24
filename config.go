@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"net/url"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -16,30 +17,42 @@ import (
 
 // KeyConfig is one API key of the gateway.
 type KeyConfig struct {
-	Name     string   `json:"name"`     // shown in logs, never the key itself
-	Key      string   `json:"key"`      // prefer key_env
-	KeyEnv   string   `json:"key_env"`  // environment variable holding the key
-	RPM      int      `json:"rpm"`      // requests per minute, 0 for no limit
-	Backends []string `json:"backends"` // allowed backends, empty for all
+	DataClass string              `json:"data_class"`
+	Project   string              `json:"project"`
+	Routes    map[string][]string `json:"routes"`
+	Name      string              `json:"name"`     // shown in logs, never the key itself
+	Key       string              `json:"key"`      // prefer key_env
+	KeyEnv    string              `json:"key_env"`  // environment variable holding the key
+	RPM       int                 `json:"rpm"`      // requests per minute, 0 for no limit
+	Backends  []string            `json:"backends"` // allowed backends, empty for all
 }
 
 // Config is the whole configuration. Every value comes, in this order of
 // precedence, from a command-line flag, an environment variable, the
 // configuration file, or its default.
 type Config struct {
-	ListenAddr     string `json:"listen_addr"`
-	ClaudeBin      string `json:"claude_bin"`
-	CodexBin       string `json:"codex_bin"`
-	WorkDir        string `json:"work_dir"`
-	APIKey         string `json:"api_key"`
-	MaxConcurrency int    `json:"max_concurrency"`
-	MaxQueue       int    `json:"max_queue"`
-	RequestTimeout int    `json:"request_timeout"` // seconds
-	Warm           int    `json:"warm"`
-	WarmIdle       int    `json:"warm_idle"` // seconds
-	SelfURL        string `json:"self_url"`
-	LogFile        string `json:"log_file"`
-	LogLevel       string `json:"log_level"`
+	Budgets        map[string]Budget    `json:"budgets"`
+	CacheTTL       int                  `json:"cache_ttl_seconds"`
+	Version        int                  `json:"version"`
+	Profile        string               `json:"profile"`
+	Ledger         string               `json:"ledger"`
+	Retries        int                  `json:"retries"`
+	PriceVersion   string               `json:"price_version"`
+	Prices         map[string]Price     `json:"prices"`
+	Discovery      map[string]Discovery `json:"discovery"`
+	ListenAddr     string               `json:"listen_addr"`
+	ClaudeBin      string               `json:"claude_bin"`
+	CodexBin       string               `json:"codex_bin"`
+	WorkDir        string               `json:"work_dir"`
+	APIKey         string               `json:"api_key"`
+	MaxConcurrency int                  `json:"max_concurrency"`
+	MaxQueue       int                  `json:"max_queue"`
+	RequestTimeout int                  `json:"request_timeout"` // seconds
+	Warm           int                  `json:"warm"`
+	WarmIdle       int                  `json:"warm_idle"` // seconds
+	SelfURL        string               `json:"self_url"`
+	LogFile        string               `json:"log_file"`
+	LogLevel       string               `json:"log_level"`
 
 	// File-only settings.
 	APIKeys         []KeyConfig         `json:"api_keys"`
@@ -101,6 +114,12 @@ func loadConfig(args []string, stderr io.Writer) (Config, error) {
 		if err != nil {
 			return cfg, fmt.Errorf("reading the configuration: %w", err)
 		}
+		if strings.EqualFold(filepath.Ext(path), ".toml") {
+			b, err = configTOML(b)
+			if err != nil {
+				return cfg, err
+			}
+		}
 		dec := json.NewDecoder(strings.NewReader(string(b)))
 		dec.DisallowUnknownFields()
 		if err := dec.Decode(&cfg); err != nil {
@@ -121,7 +140,7 @@ func loadConfig(args []string, stderr io.Writer) (Config, error) {
 	}
 	fs := flag.NewFlagSet("llm-gateway", flag.ContinueOnError)
 	fs.SetOutput(stderr)
-	fs.String("config", "", "JSON configuration file (CONFIG_FILE)")
+	fs.String("config", "", "TOML or legacy JSON configuration file (CONFIG_FILE)")
 	fs.StringVar(&cfg.ListenAddr, "addr", env("LISTEN_ADDR", cfg.ListenAddr), "listen address (LISTEN_ADDR)")
 	fs.StringVar(&cfg.ClaudeBin, "claude-bin", env("CLAUDE_BIN", cfg.ClaudeBin), "claude CLI path (CLAUDE_BIN)")
 	fs.StringVar(&cfg.CodexBin, "codex-bin", env("CODEX_BIN", cfg.CodexBin), "codex CLI path (CODEX_BIN)")
@@ -160,6 +179,9 @@ func (c *Config) validate() error {
 		c.SelfURL = "http://" + net.JoinHostPort("127.0.0.1", port)
 	}
 	c.SelfURL = strings.TrimRight(c.SelfURL, "/")
+	if c.MaxQueue < 0 {
+		return errors.New("negative max_queue")
+	}
 	if c.MaxConcurrency < 1 {
 		return errors.New("max_concurrency must be at least 1")
 	}
@@ -174,9 +196,34 @@ func (c *Config) validate() error {
 	if c.APIKey != "" {
 		c.APIKeys = append([]KeyConfig{{Name: "default", Key: c.APIKey}}, c.APIKeys...)
 	}
+	if c.Profile == "" {
+		c.Profile = "personal"
+	}
+	if c.Profile != "personal" && c.Profile != "production" {
+		return errors.New("unknown profile")
+	}
+	if c.Version < 0 || c.Version > 1 || c.Retries < 0 || c.Retries > 4 {
+		return errors.New("unsupported config version or retries outside 0..4")
+	}
+	if (c.Profile == "production" || !c.loopback()) && len(c.APIKeys) == 0 {
+		return errors.New("listener requires a gateway key")
+	}
+	if c.Profile == "production" && (len(c.Backends) > 0 || c.Ledger == "") {
+		return errors.New("production requires backends = [] and a ledger")
+	}
+	if c.Profile == "personal" && len(c.Backends) > 0 && !c.loopback() {
+		return errors.New("personal CLI backends require loopback")
+	}
 	seen := map[string]bool{}
+	credentials := map[string]bool{}
 	for i := range c.APIKeys {
 		k := &c.APIKeys[i]
+		if classLevel(k.DataClass) < 0 {
+			return errors.New("unknown data class")
+		}
+		if c.Profile == "production" && k.KeyEnv == "" {
+			return errors.New("production requires key_env on every project key")
+		}
 		if k.KeyEnv != "" {
 			k.Key = os.Getenv(k.KeyEnv)
 		}
@@ -189,6 +236,16 @@ func (c *Config) validate() error {
 		if seen[k.Name] {
 			return fmt.Errorf("api key name %q is used twice", k.Name)
 		}
+		if credentials[k.Key] {
+			return errors.New("duplicate gateway credential")
+		}
+		if k.Project == "" {
+			k.Project = k.Name
+		}
+		if !nameRE.MatchString(k.Project) {
+			return errors.New("invalid project name")
+		}
+		credentials[k.Key] = true
 		seen[k.Name] = true
 	}
 
@@ -203,6 +260,25 @@ func (c *Config) validate() error {
 		if !oneOf(u.MaxTokensField, []string{"", "max_tokens", "max_completion_tokens"}) {
 			return fmt.Errorf("upstream %q: max_tokens_field must be max_tokens or max_completion_tokens", u.Name)
 		}
+		if classLevel(u.MaxDataClass) < 0 {
+			return errors.New("unknown backend data class")
+		}
+		parsed, err := url.Parse(u.BaseURL)
+		if err != nil || parsed.Hostname() == "" || parsed.User != nil || parsed.RawQuery != "" || parsed.Fragment != "" {
+			return errors.New("invalid upstream URL")
+		}
+		if !oneOf(u.Protocol, []string{"", "openai", "azure", "anthropic"}) {
+			return errors.New("unsupported upstream protocol")
+		}
+		if c.Profile == "production" && (u.APIKey != "" || u.Protocol == "") {
+			return errors.New("production requires explicit protocol and environment credentials")
+		}
+		if u.APIKeyEnv != "" && os.Getenv(u.APIKeyEnv) == "" {
+			return fmt.Errorf("missing upstream secret for %s", u.Name)
+		}
+		if u.APIKeyEnv != "" && credentials[os.Getenv(u.APIKeyEnv)] {
+			return errors.New("upstream credential must differ from gateway credential")
+		}
 		reserved[u.Name] = true
 	}
 	for _, b := range c.Backends {
@@ -216,8 +292,47 @@ func (c *Config) validate() error {
 		}
 	}
 	for alias, targets := range c.Models {
-		if !nameRE.MatchString(alias) || len(targets) == 0 {
+		if !validAlias(alias) || len(targets) == 0 {
 			return fmt.Errorf("invalid model alias %q", alias)
+		}
+	}
+	for _, k := range c.APIKeys {
+		for _, b := range k.Backends {
+			if !reserved[b] {
+				return errors.New("unknown permitted backend")
+			}
+		}
+		for alias, targets := range k.Routes {
+			if !validAlias(alias) || len(targets) == 0 {
+				return errors.New("invalid project route")
+			}
+		}
+	}
+	routeSets := []map[string][]string{c.Models}
+	for _, k := range c.APIKeys {
+		routeSets = append(routeSets, k.Routes)
+	}
+	for _, routes := range routeSets {
+		for _, targets := range routes {
+			for _, target := range targets {
+				provider, model, _ := strings.Cut(target, "/")
+				if !reserved[provider] || (c.Profile == "production" && (model == "" || provider == "claude" || provider == "codex")) {
+					return errors.New("invalid route target")
+				}
+			}
+		}
+	}
+	for _, p := range c.Prices {
+		if !p.valid() || c.PriceVersion == "" {
+			return errors.New("invalid price or missing price_version")
+		}
+	}
+	if c.CacheTTL < 0 || c.CacheTTL > 86400 {
+		return errors.New("cache TTL must be between 0 and 86400 seconds")
+	}
+	for project, b := range c.Budgets {
+		if c.Profile != "production" || !nameRE.MatchString(project) || b.Reserve <= 0 || b.Daily < b.Reserve {
+			return errors.New("invalid production project budget")
 		}
 	}
 	_ = host
@@ -240,4 +355,27 @@ func defaultLogFile() string {
 		dir = os.TempDir()
 	}
 	return filepath.Join(dir, "llm-gateway", "llm-gateway.log")
+}
+
+func validAlias(s string) bool {
+	for _, part := range strings.Split(s, "/") {
+		if !nameRE.MatchString(part) {
+			return false
+		}
+	}
+	return true
+}
+
+func classLevel(s string) int {
+	switch s {
+	case "":
+		return 0
+	case "synthetic":
+		return 1
+	case "pseudonymized":
+		return 2
+	case "client":
+		return 3
+	}
+	return -1
 }

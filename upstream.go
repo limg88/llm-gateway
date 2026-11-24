@@ -16,11 +16,13 @@ import (
 // UpstreamConfig describes an OpenAI-compatible HTTP API (OpenAI, Ollama,
 // vLLM, LM Studio, OpenRouter, another gateway...) used as a backend.
 type UpstreamConfig struct {
-	Name      string   `json:"name"`
-	BaseURL   string   `json:"base_url"`    // up to and including /v1
-	APIKey    string   `json:"api_key"`     // prefer api_key_env
-	APIKeyEnv string   `json:"api_key_env"` // environment variable holding the key
-	Models    []string `json:"models"`      // advertised by /v1/models
+	MaxDataClass string   `json:"max_data_class"`
+	Protocol     string   `json:"protocol"`
+	Name         string   `json:"name"`
+	BaseURL      string   `json:"base_url"`    // up to and including /v1
+	APIKey       string   `json:"api_key"`     // prefer api_key_env
+	APIKeyEnv    string   `json:"api_key_env"` // environment variable holding the key
+	Models       []string `json:"models"`      // advertised by /v1/models
 	// MaxTokensField names the output budget for this API: max_tokens or
 	// max_completion_tokens. Empty to use the name the client used, and
 	// max_tokens for a budget that came through another API.
@@ -43,7 +45,7 @@ func NewUpstreamBackend(cfg UpstreamConfig) *UpstreamBackend {
 		key = os.Getenv(cfg.APIKeyEnv)
 	}
 	cfg.BaseURL = strings.TrimRight(cfg.BaseURL, "/")
-	return &UpstreamBackend{cfg: cfg, key: key, client: &http.Client{}}
+	return &UpstreamBackend{cfg: cfg, key: key, client: &http.Client{CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}}
 }
 
 func (u *UpstreamBackend) Name() string              { return u.cfg.Name }

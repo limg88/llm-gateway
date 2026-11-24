@@ -9,7 +9,6 @@ import (
 	"encoding/json"
 	"io"
 	"log/slog"
-	"os"
 	"os/exec"
 	"strconv"
 	"strings"
@@ -165,9 +164,10 @@ func (c *ClaudeBackend) start(model string, p Prompt) (*claudeProc, error) {
 		url, unpublish = c.Publish(p.Functions)
 	}
 	cmd := exec.Command(c.Bin, c.args(model, p, url)...)
+	cmd.Env = childEnvironment()
 	cmd.Dir = c.WorkDir
 	if p.MaxTokens > 0 {
-		cmd.Env = append(os.Environ(), "CLAUDE_CODE_MAX_OUTPUT_TOKENS="+strconv.Itoa(p.MaxTokens))
+		cmd.Env = append(childEnvironment(), "CLAUDE_CODE_MAX_OUTPUT_TOKENS="+strconv.Itoa(p.MaxTokens))
 	}
 	proc := &claudeProc{cmd: cmd, lines: make(chan []byte, 64), done: make(chan struct{}), cleanup: unpublish}
 	cmd.Stderr = &limitedWriter{w: &proc.stderr, n: maxStderr}
@@ -407,7 +407,7 @@ func (s *claudeStream) pieces(pieces []textPiece) {
 			s.send(Event{Text: pc.text})
 			continue
 		}
-		slog.Warn("claude: function call written as text, made a call", "function", pc.call.Name)
+		slog.Warn("claude: function call written as text, made a call")
 		s.send(Event{Call: &CallEvent{Index: s.calls, ID: "call_" + randomID(), Name: pc.call.Name, Args: pc.call.Arguments, Done: true}})
 		s.calls++
 	}

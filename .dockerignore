@@ -2,3 +2,8 @@
 *.md
 config.json
 llm-gateway
+.env
+.env.*
+gateway.toml
+usage.jsonl
+usage.jsonl.lock

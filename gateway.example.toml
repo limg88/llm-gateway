@@ -1,0 +1,52 @@
+# API production profile. Set the three environment variables before startup.
+version = 1
+profile = "production"
+backends = []
+listen_addr = "127.0.0.1:8080"
+ledger = "usage.jsonl"
+request_timeout = 27
+retries = 1
+metrics_public = false
+price_version = "standard-usd-2026-11-24"
+
+[[api_keys]]
+name = "repo-pilot-worker"
+project = "repo-pilot"
+key_env = "GATEWAY_PROJECT_KEY"
+rpm = 60
+backends = ["openai", "anthropic"]
+
+[[upstreams]]
+name = "openai"
+protocol = "openai"
+base_url = "https://api.openai.com/v1"
+api_key_env = "OPENAI_API_KEY"
+models = ["gpt-5.4-mini"]
+max_tokens_field = "max_completion_tokens"
+
+[[upstreams]]
+name = "anthropic"
+protocol = "anthropic"
+base_url = "https://api.anthropic.com/v1"
+api_key_env = "ANTHROPIC_API_KEY"
+models = ["claude-sonnet-4-6"]
+
+[models]
+# Public legacy alias; select the desired OpenAI-compatible deployment here.
+"claude/sonnet" = ["openai/gpt-5.4-mini"]
+"native-sonnet" = ["anthropic/claude-sonnet-4-6"]
+
+# USD per million text tokens. Check negotiated rates before deployment.
+# https://developers.openai.com/api/docs/models/gpt-5.4-mini
+[prices."openai/gpt-5.4-mini"]
+input = 0.75
+output = 4.5
+cache_read = 0.075
+
+# https://platform.claude.com/docs/en/models/sonnet-4-6/overview
+[prices."anthropic/claude-sonnet-4-6"]
+input = 3
+output = 15
+cache_read = 0.30
+cache_write = 3.75
+cache_write_1h = 6

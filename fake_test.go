@@ -19,7 +19,7 @@ import (
 const fakeEnv = "LLM_GATEWAY_FAKE_CLI"
 
 // fakeSecret stands for a credential a backend lets slip in its errors.
-const fakeSecret = "sk-test-0123456789abcdefSECRET"
+var fakeSecret = "sk-test-" + strings.Repeat("a1", 12)
 
 func TestMain(m *testing.M) {
 	if os.Getenv(fakeEnv) != "" && len(os.Args) > 1 {
@@ -36,6 +36,10 @@ func TestMain(m *testing.M) {
 		}
 		os.Exit(0)
 	}
+	if os.Getenv("GATEWAY_TEST_PIPE") == "1" {
+		enablePipeTransport()
+	}
+	childEnvNames = append(childEnvNames, fakeEnv)
 	os.Setenv(fakeEnv, "1")
 	if os.Getenv("TEST_LOGS") == "" {
 		slog.SetDefault(slog.New(slog.NewTextHandler(io.Discard, nil)))
@@ -104,6 +108,9 @@ func fakeClaude(args []string) {
 	}
 
 	switch {
+	case strings.Contains(prompt, "BUSY_CLAUDE"):
+		fmt.Fprintln(os.Stderr, "503 overloaded")
+		os.Exit(1)
 	case strings.Contains(prompt, "FAIL_CLAUDE"):
 		fmt.Fprintln(os.Stderr, "boom: not logged in")
 		os.Exit(1)

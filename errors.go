@@ -4,7 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"log/slog"
+
 	"math"
 	"net/http"
 	"regexp"
@@ -90,7 +90,7 @@ var errNoOutput = errors.New("the backend returned no output")
 // answer over the output budget would be over it elsewhere too.
 func canFallback(err error) bool {
 	var be *BackendError
-	return !errors.As(err, &be) || be.Kind != failOutputLimit
+	return errors.As(err, &be) && (be.Kind == failGeneric || be.Kind == failRateLimit || be.Kind == failOverloaded || be.Kind == failTimeout || be.Kind == failQuota)
 }
 
 var failPatterns = []struct {
@@ -228,21 +228,8 @@ func publicError(err error) *apiErr {
 	return &apiErr{status: f.status, typ: f.typ, code: f.code, msg: f.text}
 }
 
-// logFailure describes a failure for the log: always by its code, and at
-// the debug level also by what the backend said, redacted and cut. Those
-// words can quote the conversation, so they stay out of an ordinary log.
-func logFailure(err error) []any {
-	attrs := []any{"code", publicError(err).code}
-	if slog.Default().Enabled(context.Background(), slog.LevelDebug) {
-		detail := redact(err.Error())
-		var be *BackendError
-		if errors.As(err, &be) {
-			detail = be.Detail
-		}
-		attrs = append(attrs, "detail", detail)
-	}
-	return attrs
-}
+// Never emit upstream text: it may contain prompts or unrecognizable secrets.
+func logFailure(err error) []any { return []any{"code", publicError(err).code} }
 
 // retrySeconds is the wait to tell the client, in whole seconds; zero for
 // none.

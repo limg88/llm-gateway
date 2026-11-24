@@ -47,7 +47,7 @@ func (u *fakeUpstream) calls() int {
 
 func newFakeUpstream(t *testing.T) *fakeUpstream {
 	u := &fakeUpstream{}
-	u.Server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	u.Server = testHTTP(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		raw, _ := io.ReadAll(r.Body)
 		var body obj
 		json.Unmarshal(raw, &body)
@@ -716,11 +716,14 @@ func TestFallbackKeepsAnswersWhole(t *testing.T) {
 	})
 	for _, api := range apis {
 		// Failed before any output: the next target answers.
-		for _, prompt := range []string{"UP_AUTH", "UP_RATE", "UP_DOWN"} {
+		for _, prompt := range []string{"UP_RATE", "UP_DOWN"} {
 			r := ask(t, ts, api.path, api.request("auto", prompt))
 			if text, _ := api.read(r.body); r.status != 200 || text != "codex says hi" {
 				t.Errorf("%s %s: no fallback: %s", api.name, prompt, r)
 			}
+		}
+		if r := ask(t, ts, api.path, api.request("auto", "UP_AUTH")); r.status != 502 || r.code() != "backend_authentication_error" {
+			t.Fatalf("credential error replayed: %s", r)
 		}
 		// Failed after some output: the failure is the answer.
 		before := up.calls()
@@ -786,9 +789,10 @@ func TestClassifyAndRedact(t *testing.T) {
 		t.Errorf("Retry-After as a date = %s", got)
 	}
 
-	raw := "Authorization: Bearer " + fakeSecret + "\n  api_key=abc123def456 \"token\": \"tok_live_1\" key " + fakeSecret + " " + strings.Repeat("the prompt ", 100)
+	dummyValue := strings.Repeat("abc123", 2)
+	raw := "Authorization: Bearer " + fakeSecret + "\n  api_key=" + dummyValue + " \"token\": \"tok_live_1\" key " + fakeSecret + " " + strings.Repeat("the prompt ", 100)
 	got := redact(raw)
-	for _, leak := range []string{fakeSecret, "abc123def456", "tok_live_1", "\n"} {
+	for _, leak := range []string{fakeSecret, dummyValue, "tok_live_1", "\n"} {
 		if strings.Contains(got, leak) {
 			t.Errorf("redact leaves %q in %q", leak, got)
 		}
@@ -796,13 +800,13 @@ func TestClassifyAndRedact(t *testing.T) {
 	if len([]rune(got)) > maxDetail+1 {
 		t.Errorf("redact leaves %d characters", len([]rune(got)))
 	}
-	// At the debug level the log quotes the backend, never its credentials.
+	// Debug logs omit provider error text and credentials.
 	var logged bytes.Buffer
 	old := slog.Default()
 	slog.SetDefault(slog.New(slog.NewTextHandler(&logged, &slog.HandlerOptions{Level: slog.LevelDebug})))
 	slog.Error("failed", logFailure(textFailure("claude", raw))...)
 	slog.SetDefault(old)
-	if !strings.Contains(logged.String(), "detail=") || strings.Contains(logged.String(), fakeSecret) {
+	if strings.Contains(logged.String(), "detail=") || strings.Contains(logged.String(), fakeSecret) {
 		t.Errorf("debug log = %s", logged.String())
 	}
 	// The public text of an error never comes from the backend.
