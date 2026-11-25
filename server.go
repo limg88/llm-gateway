@@ -28,6 +28,9 @@ type Server struct {
 	cache        responseCache
 	budgetDay    string
 	spent        map[string]float64
+	memoryLedger map[int64][]auditEntry
+	memoryUsage  map[string]projectUsage
+	activeTraces map[string]activeTrace
 	ledgerFailed bool
 	ledgerMu     sync.Mutex
 	cfg          Config
@@ -53,13 +56,16 @@ var anonymous = &apiKey{KeyConfig: KeyConfig{Name: "anonymous", Project: "person
 
 func NewServer(cfg Config) *Server {
 	s := &Server{
-		cfg:      cfg,
-		backends: map[string]Backend{},
-		sem:      make(chan struct{}, cfg.MaxConcurrency),
-		mcp:      newMCPRegistry(),
-		store:    newConversationStore(time.Duration(cfg.ResponseTTL)*time.Second, cfg.ResponseMax),
-		metrics:  NewMetrics(),
-		started:  time.Now(),
+		cfg:          cfg,
+		memoryLedger: make(map[int64][]auditEntry),
+		memoryUsage:  make(map[string]projectUsage),
+		activeTraces: make(map[string]activeTrace),
+		backends:     map[string]Backend{},
+		sem:          make(chan struct{}, cfg.MaxConcurrency),
+		mcp:          newMCPRegistry(),
+		store:        newConversationStore(time.Duration(cfg.ResponseTTL)*time.Second, cfg.ResponseMax),
+		metrics:      NewMetrics(),
+		started:      time.Now(),
 	}
 	for _, name := range cfg.Backends {
 		switch name {
@@ -149,9 +155,8 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /mcp/{id}", s.handleMCP)
 	for _, prefix := range []string{"", "/v1"} {
 		mux.Handle("POST "+prefix+"/embeddings", s.auth(s.native("embeddings", nil)))
-		if s.cfg.Ledger != "" {
-			mux.Handle("GET "+prefix+"/usage", s.auth(http.HandlerFunc(s.handleUsage)))
-		}
+		mux.Handle("GET "+prefix+"/usage", s.auth(http.HandlerFunc(s.handleUsage)))
+		mux.Handle("GET "+prefix+"/attempts", s.auth(http.HandlerFunc(s.handleAttempts)))
 		mux.Handle("GET "+prefix+"/models", s.auth(http.HandlerFunc(s.handleModels)))
 		mux.Handle("POST "+prefix+"/chat/completions", s.auth(s.native("chat/completions", s.handleChatCompletions)))
 		mux.Handle("POST "+prefix+"/responses", s.auth(s.native("responses", s.handleResponses)))
@@ -467,7 +472,7 @@ func applyFormat(p *Prompt, f *ResponseFormat) error {
 
 // run waits for a free slot and starts the job. The events must be read to
 // the end: the slot is released when they are.
-func (s *Server) run(ctx context.Context, j *job) (<-chan Event, *apiErr) {
+func (s *Server) run(ctx context.Context, j *job, trace requestTrace) (<-chan Event, *apiErr) {
 	if err := s.acquire(ctx); err != nil {
 		return nil, err
 	}
@@ -475,11 +480,10 @@ func (s *Server) run(ctx context.Context, j *job) (<-chan Event, *apiErr) {
 	go func() {
 		defer close(out)
 		defer s.release()
-		id := requestID()
 		for i, t := range j.targets {
 			j.used = t.label
 			last := i == len(j.targets)-1
-			entry := auditEntry{Project: j.project, Request: id, Target: t.label, Attempt: i + 1, Outcome: "started"}
+			entry := auditEntry{Project: j.project, Request: trace.id, ClientRequest: trace.clientID, Target: t.label, Attempt: i + 1, Outcome: "started"}
 			if err := s.audit(entry); err != nil {
 				out <- Event{Err: errors.New("accounting unavailable")}
 				return
@@ -700,7 +704,7 @@ func decodeBody(w http.ResponseWriter, r *http.Request, v any) *apiErr {
 
 // ---- chat completions ----
 
-func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
+func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request, trace requestTrace) {
 	var req ChatCompletionRequest
 	if aerr := decodeBody(w, r, &req); aerr != nil {
 		writeAPIErr(w, aerr)
@@ -713,7 +717,7 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 	}
 	ctx, cancel := context.WithTimeout(r.Context(), time.Duration(s.cfg.RequestTimeout)*time.Second)
 	defer cancel()
-	events, aerr := s.run(ctx, j)
+	events, aerr := s.run(ctx, j, trace)
 	if aerr != nil {
 		writeAPIErr(w, aerr)
 		return

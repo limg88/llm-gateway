@@ -26,10 +26,19 @@ Per il binario nativo eseguire `go build -o llm-gateway .` e `./llm-gateway -con
 | `POST /v1/embeddings` | Endpoint OpenAI-compatibile o Azure per un encoder configurato. |
 | `POST /v1/responses` | Nativo stateless su provider OpenAI-compatibili che lo implementano. Le conversazioni continuabili del profilo CLI restano nella memoria del gateway. |
 | `GET /v1/models` | Catalogo filtrato per chiave e classe dati, con alias e metadati di discovery configurabili. |
-| `GET /v1/usage` | Totali del progetto associato alla chiave quando il registro è configurato. Importi USD stimati, token per categoria, cache hit e tentativi non valorizzati o aperti. |
+| `GET /v1/usage` | Totali del progetto associato alla chiave. Nel profilo personale senza file di registro i totali coprono la vita del processo. Importi USD stimati, token per categoria, cache hit e tentativi non valorizzati o aperti. |
+| `GET /v1/attempts?client_request_id=<id>` | Tentativi del progetto per ID client, nel giorno UTC corrente e nel precedente. |
 | `GET /health`, `GET /metrics` | Stato del processo e metriche Prometheus. Nel TOML di esempio le metriche richiedono la chiave progetto. |
 
 Per usare l'SDK OpenAI impostare `base_url=http://localhost:8080/v1`. Per l'SDK Anthropic usare `base_url=http://localhost:8080` e l'alias `native-sonnet`. Con Repo Pilot passare l'URL completo `http://localhost:8080/v1/chat/completions`. Nell'esempio il suo alias legacy `claude/sonnet` seleziona **OpenAI GPT-5.4 mini**: verificare la destinazione autorizzata prima di inviare dati. L'endpoint Messages seleziona un upstream con `protocol = "anthropic"`. Gli alias con fallback devono elencare destinazioni capaci di eseguire lo stesso contratto. Il gateway conserva gli ID e gli argomenti dei tool; è il consumer a eseguirli.
+
+### Riconciliazione con Repo Pilot
+
+Chat Completions e Messages restituiscono `X-Request-Id` anche con le CLI e in streaming. Per ritrovare una chiamata dopo un’interruzione, inviare `X-Client-Request-Id` con un valore conforme a `[A-Za-z0-9_.:#-]{8,200}`. Il gateway lo restituisce nella risposta. Un valore non valido produce HTTP 400. Riutilizzare l’ID avvia una nuova richiesta soggetta alle consuete regole di cache, retry e budget.
+
+Impostare `REPO_PILOT_RECONCILE_URL=http://localhost:8080/v1/attempts`. La ricerca usa la stessa chiave di `/v1/usage`. Con HTTP 200, `attempts` contiene i tentativi chiusi e `unsettled_attempts` conta quelli ancora privi di esito. Anche una richiesta in coda o in attesa di retry risulta aperta. Se il contatore è positivo, ripetere la ricerca più tardi. Un tentativo chiuso senza dati di utilizzo ha `tokens: null`. Il registro conserva solo metadati e consumi.
+
+HTTP 404 indica che nel periodo consultabile manca una riga per il progetto e l’ID. Nel profilo personale, configurare `ledger` per mantenere lo storico anche dopo un riavvio del gateway.
 
 ## Configurazione
 
