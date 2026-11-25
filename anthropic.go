@@ -168,7 +168,7 @@ func toolUseBlock(tc ToolCall) anthropicBlock {
 	return anthropicBlock{Type: "tool_use", ID: tc.ID, Name: tc.Function.Name, Input: input}
 }
 
-func (s *Server) handleMessages(w http.ResponseWriter, r *http.Request) {
+func (s *Server) handleMessages(w http.ResponseWriter, r *http.Request, trace requestTrace) {
 	var req MessagesRequest
 	if aerr := decodeBody(w, r, &req); aerr != nil {
 		writeAnthropicAPIErr(w, aerr)
@@ -186,7 +186,7 @@ func (s *Server) handleMessages(w http.ResponseWriter, r *http.Request) {
 	}
 	ctx, cancel := context.WithTimeout(r.Context(), time.Duration(s.cfg.RequestTimeout)*time.Second)
 	defer cancel()
-	events, aerr := s.run(ctx, j)
+	events, aerr := s.run(ctx, j, trace)
 	if aerr != nil {
 		writeAnthropicAPIErr(w, aerr)
 		return

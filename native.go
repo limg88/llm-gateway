@@ -14,6 +14,7 @@ import (
 	randv2 "math/rand/v2"
 	"mime"
 	"net/http"
+	"regexp"
 	"time"
 )
 
@@ -26,9 +27,30 @@ func nativeError(w http.ResponseWriter, endpoint string, status int, code string
 	writeAPIErr(w, &apiErr{status: status, typ: code, code: code, msg: http.StatusText(status)})
 }
 
+const clientIDHeader = "X-Client-Request-Id"
+
+var clientIDPattern = regexp.MustCompile(`^[A-Za-z0-9_.:#-]{8,200}$`)
+
+type requestTrace struct{ id, clientID string }
+type legacyHandler func(http.ResponseWriter, *http.Request, requestTrace)
+
 // Explicit native protocols bypass the legacy CLI prompt and event translation.
-func (s *Server) native(endpoint string, legacy http.HandlerFunc) http.HandlerFunc {
+func (s *Server) native(endpoint string, legacy legacyHandler) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
+		trace := requestTrace{id: requestID()}
+		w.Header().Set("X-Request-Id", trace.id)
+		if endpoint == "chat/completions" || endpoint == "messages" {
+			if values := r.Header.Values(clientIDHeader); len(values) > 0 {
+				if len(values) != 1 || !clientIDPattern.MatchString(values[0]) {
+					nativeError(w, endpoint, 400, "invalid_client_request_id")
+					return
+				}
+				trace.clientID = values[0]
+				w.Header().Set(clientIDHeader, trace.clientID)
+				finish := s.trackRequest(keyOf(r).Project, trace)
+				defer finish()
+			}
+		}
 		ctx, cancel := context.WithTimeout(r.Context(), time.Duration(s.cfg.RequestTimeout)*time.Second)
 		defer cancel()
 		body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, maxBody))
@@ -59,7 +81,7 @@ func (s *Server) native(endpoint string, legacy http.HandlerFunc) http.HandlerFu
 				return
 			}
 			r.Body = io.NopCloser(bytes.NewReader(body))
-			legacy(w, r)
+			legacy(w, r, trace)
 			return
 		}
 		if endpoint == "responses" {
@@ -91,8 +113,7 @@ func (s *Server) native(endpoint string, legacy http.HandlerFunc) http.HandlerFu
 			return
 		}
 		defer s.release()
-		id := requestID()
-		w.Header().Set("X-Request-Id", id)
+
 		attempt, lastStatus := 0, 400
 		previousProvider := ""
 		for _, t := range targets {
@@ -119,7 +140,7 @@ func (s *Server) native(endpoint string, legacy http.HandlerFunc) http.HandlerFu
 				digest := cacheKey(key, t.label, payload)
 				ck = &digest
 				if cached := s.cache.get(digest); cached != nil {
-					err := s.audit(auditEntry{Project: key.Project, Request: id, Target: t.label, Outcome: "cached"})
+					err := s.audit(auditEntry{Project: key.Project, Request: trace.id, ClientRequest: trace.clientID, Target: t.label, Outcome: "cached"})
 					if err != nil {
 						nativeError(w, endpoint, 503, "accounting_unavailable")
 						return
@@ -136,7 +157,7 @@ func (s *Server) native(endpoint string, legacy http.HandlerFunc) http.HandlerFu
 			previousProvider = u.Name()
 			for retry := 0; retry <= s.cfg.Retries; retry++ {
 				attempt++
-				entry := auditEntry{Request: id, Project: key.Project, Target: t.label, Attempt: attempt, Outcome: "started", BudgetDay: time.Now().UTC().Format(time.DateOnly)}
+				entry := auditEntry{Request: trace.id, ClientRequest: trace.clientID, Project: key.Project, Target: t.label, Attempt: attempt, Outcome: "started", BudgetDay: time.Now().UTC().Format(time.DateOnly)}
 				if err := s.audit(entry); err != nil {
 					if errors.Is(err, errBudget) {
 						nativeError(w, endpoint, 403, "project_budget_exhausted")

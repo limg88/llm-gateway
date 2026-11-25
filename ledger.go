@@ -63,18 +63,19 @@ func (p Price) cost(u *Units) *float64 {
 }
 
 type auditEntry struct {
-	BudgetDay    string    `json:"budget_day,omitempty"`
-	BudgetDelta  float64   `json:"budget_delta_usd,omitempty"`
-	At           time.Time `json:"at"`
-	Request      string    `json:"request_id"`
-	Project      string    `json:"project"`
-	Target       string    `json:"target"`
-	Attempt      int       `json:"attempt"`
-	Outcome      string    `json:"outcome"`
-	Status       int       `json:"upstream_status,omitempty"`
-	Units        *Units    `json:"tokens"`
-	Cost         *float64  `json:"estimated_cost_usd"`
-	PriceVersion string    `json:"price_version,omitempty"`
+	BudgetDay     string    `json:"budget_day,omitempty"`
+	BudgetDelta   float64   `json:"budget_delta_usd,omitempty"`
+	At            time.Time `json:"at"`
+	ClientRequest string    `json:"client_request_id,omitempty"`
+	Request       string    `json:"request_id"`
+	Project       string    `json:"project"`
+	Target        string    `json:"target"`
+	Attempt       int       `json:"attempt"`
+	Outcome       string    `json:"outcome"`
+	Status        int       `json:"upstream_status,omitempty"`
+	Units         *Units    `json:"tokens"`
+	Cost          *float64  `json:"estimated_cost_usd"`
+	PriceVersion  string    `json:"price_version,omitempty"`
 }
 
 func (s *Server) checkLedger() error {
@@ -133,6 +134,20 @@ func (s *Server) audit(e auditEntry) error {
 		e.Cost = &zero
 	}
 	if s.cfg.Ledger == "" {
+		s.ledgerMu.Lock()
+		day := e.At.Unix() / 86400
+		for d := range s.memoryLedger {
+			if d < day-1 {
+				delete(s.memoryLedger, d)
+			}
+		}
+		if e.ClientRequest != "" {
+			s.memoryLedger[day] = append(s.memoryLedger[day], e)
+		}
+		totals := s.memoryUsage[e.Project]
+		totals.add(e)
+		s.memoryUsage[e.Project] = totals
+		s.ledgerMu.Unlock()
 		slog.Info("usage", "attempt", e)
 		return nil
 	}
@@ -180,20 +195,76 @@ func (s *Server) audit(e auditEntry) error {
 	return nil
 }
 
-// Summarize completed attempt records for this credential's project only.
-// An interrupted attempt with missing usage stays visibly unpriced.
+type projectUsage struct {
+	Project  string  `json:"project"`
+	Attempts int     `json:"finished_attempts"`
+	Open     int     `json:"unsettled_attempts"`
+	Hits     int     `json:"cache_hits"`
+	Unknown  int     `json:"unpriced_attempts"`
+	Cost     float64 `json:"known_estimated_cost_usd"`
+	Tokens   Units   `json:"known_tokens"`
+}
+
+func (totals *projectUsage) add(e auditEntry) {
+	if e.Outcome == "started" {
+		totals.Open++
+		return
+	}
+	if e.Outcome == "cached" {
+		totals.Hits++
+		return
+	}
+	totals.Open--
+	totals.Attempts++
+	if e.Cost == nil {
+		totals.Unknown++
+	} else {
+		totals.Cost += *e.Cost
+	}
+	if u := e.Units; u != nil {
+		totals.Tokens.Input += u.Input
+		totals.Tokens.Output += u.Output
+		totals.Tokens.Read += u.Read
+		totals.Tokens.Write += u.Write
+		totals.Tokens.Hour += u.Hour
+	}
+}
+
 func (s *Server) handleUsage(w http.ResponseWriter, r *http.Request) {
 	project := keyOf(r).Project
-	totals := struct {
-		Project  string  `json:"project"`
-		Attempts int     `json:"finished_attempts"`
-		Open     int     `json:"unsettled_attempts"`
-		Hits     int     `json:"cache_hits"`
-		Unknown  int     `json:"unpriced_attempts"`
-		Cost     float64 `json:"known_estimated_cost_usd"`
-		Tokens   Units   `json:"known_tokens"`
-	}{Project: project}
+	totals := projectUsage{Project: project}
+	if s.cfg.Ledger == "" {
+		s.ledgerMu.Lock()
+		totals = s.memoryUsage[project]
+		s.ledgerMu.Unlock()
+		totals.Project = project
+	} else if err := s.visitLedger(project, nil, totals.add); err != nil {
+		nativeError(w, "usage", 503, "accounting_unavailable")
+		return
+	}
+	writeJSON(w, 200, totals)
+}
+
+func (s *Server) visitLedger(project string, snapshotLive func(), visit func(auditEntry)) error {
 	s.ledgerMu.Lock()
+	// Take the live-request snapshot and the journal watermark under one lock.
+	if snapshotLive != nil {
+		snapshotLive()
+	}
+	if s.cfg.Ledger == "" {
+		day := time.Now().UTC().Unix() / 86400
+		// Snapshot slice headers under lock. Published entries are immutable.
+		days := [][]auditEntry{s.memoryLedger[day-1], s.memoryLedger[day]}
+		s.ledgerMu.Unlock()
+		for _, entries := range days {
+			for _, e := range entries {
+				if e.Project == project {
+					visit(e)
+				}
+			}
+		}
+		return nil
+	}
 	f, err := os.Open(s.cfg.Ledger)
 	var size int64
 	if err == nil {
@@ -208,8 +279,7 @@ func (s *Server) handleUsage(w http.ResponseWriter, r *http.Request) {
 		defer f.Close()
 	}
 	if err != nil {
-		nativeError(w, "usage", 503, "accounting_unavailable")
-		return
+		return err
 	}
 	dec := json.NewDecoder(io.LimitReader(f, size))
 	for {
@@ -219,34 +289,95 @@ func (s *Server) handleUsage(w http.ResponseWriter, r *http.Request) {
 			break
 		}
 		if err != nil {
-			nativeError(w, "usage", 503, "accounting_unavailable")
-			return
+			return err
 		}
 		if e.Project != project {
 			continue
 		}
-		if e.Outcome == "started" {
-			totals.Open++
-			continue
-		}
-		if e.Outcome == "cached" {
-			totals.Hits++
-			continue
-		}
-		totals.Open--
-		totals.Attempts++
-		if e.Cost == nil {
-			totals.Unknown++
-		} else {
-			totals.Cost += *e.Cost
-		}
-		if u := e.Units; u != nil {
-			totals.Tokens.Input += u.Input
-			totals.Tokens.Output += u.Output
-			totals.Tokens.Read += u.Read
-			totals.Tokens.Write += u.Write
-			totals.Tokens.Hour += u.Hour
-		}
+		visit(e)
 	}
-	writeJSON(w, 200, totals)
+	return nil
+}
+
+// Keep a live request visible while it waits for admission or its next retry.
+// Its durable started row takes over if the process stops during a provider call.
+type activeTrace struct{ project, clientID string }
+
+func (s *Server) trackRequest(project string, trace requestTrace) func() {
+	s.ledgerMu.Lock()
+	s.activeTraces[trace.id] = activeTrace{project, trace.clientID}
+	s.ledgerMu.Unlock()
+	return func() {
+		s.ledgerMu.Lock()
+		delete(s.activeTraces, trace.id)
+		s.ledgerMu.Unlock()
+	}
+}
+
+type attemptResult struct {
+	Request string    `json:"request_id"`
+	Attempt int       `json:"attempt"`
+	Target  string    `json:"target"`
+	Outcome string    `json:"outcome"`
+	Status  int       `json:"upstream_status,omitempty"`
+	Tokens  *Units    `json:"tokens"`
+	Cost    *float64  `json:"estimated_cost_usd"`
+	At      time.Time `json:"at"`
+}
+type attemptsResponse struct {
+	ClientID  string          `json:"client_request_id"`
+	Unsettled int             `json:"unsettled_attempts"`
+	Attempts  []attemptResult `json:"attempts"`
+}
+
+func (s *Server) handleAttempts(w http.ResponseWriter, r *http.Request) {
+	ids := r.URL.Query()["client_request_id"]
+	if len(ids) != 1 || !clientIDPattern.MatchString(ids[0]) {
+		nativeError(w, "attempts", 400, "invalid_client_request_id")
+		return
+	}
+	result := attemptsResponse{ClientID: ids[0], Attempts: []attemptResult{}}
+	type key struct {
+		request string
+		attempt int
+	}
+	open := make(map[key]bool)
+	cutoff := time.Now().UTC().Truncate(24*time.Hour).AddDate(0, 0, -1)
+	project := keyOf(r).Project
+	live := make(map[string]bool)
+	err := s.visitLedger(project, func() {
+		for id, trace := range s.activeTraces {
+			if trace.project == project && trace.clientID == result.ClientID {
+				live[id] = true
+			}
+		}
+	}, func(e auditEntry) {
+		if e.ClientRequest != result.ClientID || e.At.Before(cutoff) {
+			return
+		}
+		k := key{e.Request, e.Attempt}
+		if e.Outcome == "started" {
+			open[k] = true
+			return
+		}
+		delete(open, k)
+		outcome := e.Outcome
+		if outcome == "completed" {
+			outcome = "ok"
+		}
+		result.Attempts = append(result.Attempts, attemptResult{Request: e.Request, Attempt: e.Attempt, Target: e.Target, Outcome: outcome, Status: e.Status, Tokens: e.Units, Cost: e.Cost, At: e.At})
+	})
+	if err != nil {
+		nativeError(w, "attempts", 503, "accounting_unavailable")
+		return
+	}
+	for k := range open {
+		delete(live, k.request)
+	}
+	result.Unsettled = len(open) + len(live)
+	if result.Unsettled == 0 && len(result.Attempts) == 0 {
+		nativeError(w, "attempts", 404, "attempts_not_found")
+		return
+	}
+	writeJSON(w, 200, result)
 }

@@ -117,11 +117,15 @@ func TestNativeIncremental(t *testing.T) {
 			})
 			req, _ := http.NewRequest("POST", gateway.URL+"/v1/"+endpoint, strings.NewReader(`{"model":"api/m","stream":true,"cache_control":{"type":"ephemeral"},"messages":[]}`))
 			req.Header.Set("anthropic-beta", "test-beta")
+			req.Header.Set(clientIDHeader, "native:stream")
 			resp, err := http.DefaultClient.Do(req)
 			if err != nil {
 				t.Fatal(err)
 			}
 			defer resp.Body.Close()
+			if resp.Header.Get("X-Request-Id") == "" || resp.Header.Get(clientIDHeader) != "native:stream" {
+				t.Error("missing stream correlation headers")
+			}
 			reader := bufio.NewReader(resp.Body)
 			var got strings.Builder
 			for {

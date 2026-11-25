@@ -103,7 +103,7 @@ func jsonString(s string) json.RawMessage {
 	return b
 }
 
-func (s *Server) handleResponses(w http.ResponseWriter, r *http.Request) {
+func (s *Server) handleResponses(w http.ResponseWriter, r *http.Request, trace requestTrace) {
 	var req ResponsesRequest
 	if aerr := decodeBody(w, r, &req); aerr != nil {
 		writeAPIErr(w, aerr)
@@ -145,7 +145,7 @@ func (s *Server) handleResponses(w http.ResponseWriter, r *http.Request) {
 	}
 	ctx, cancel := context.WithTimeout(r.Context(), time.Duration(s.cfg.RequestTimeout)*time.Second)
 	defer cancel()
-	events, aerr := s.run(ctx, j)
+	events, aerr := s.run(ctx, j, trace)
 	if aerr != nil {
 		writeAPIErr(w, aerr)
 		return
